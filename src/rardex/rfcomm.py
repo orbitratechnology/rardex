@@ -89,6 +89,12 @@ def parse(frame: int, timestamp_us: int, direction: Direction, conn: int, data: 
     return RfcommFrame(frame, timestamp_us, direction, conn, dlci, kind, pf, credits, payload, fcs_ok)
 
 
+def build_control(dlci: int, kind: int, initiator: bool = True) -> bytes:
+    """SABM/UA/DISC/DM frame (no information field), P/F bit set."""
+    head = bytes([(dlci << 2) | (0x02 if initiator else 0x00) | 0x01, kind | PF_BIT, 0x01])
+    return head + bytes([fcs(head)])
+
+
 def build_uih(dlci: int, payload: bytes, initiator: bool = True, credits: int | None = None) -> bytes:
     """Build a UIH data frame; ``initiator`` sets the C/R bit as the connecting side does."""
     address = (dlci << 2) | (0x02 if initiator else 0x00) | 0x01

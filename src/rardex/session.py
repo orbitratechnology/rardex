@@ -1,32 +1,34 @@
 """One call from a btsnoop file to the things a reverser cares about.
 
-``decode(capture)`` runs every layer (HCI -> L2CAP -> ATT/RFCOMM) and returns a ``Session``
-with the connections, the reconstructed GATT table and a list of application-data
-"messages" in capture order: BLE writes/notifications/reads and RFCOMM serial data.
+``decode(capture)`` runs every layer (HCI -> L2CAP -> ATT/RFCOMM/AVCTP/AVDTP) and returns a
+``Session`` with the connections, the reconstructed GATT table and a list of application
+"messages" in capture order: BLE writes/notifications/reads, RFCOMM serial data (including
+HFP AT commands), AVRCP button/volume messages and AVDTP codec negotiation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import att, rfcomm
+from . import att, avdtp, avrcp, hfp, rfcomm
 from .btsnoop import Capture, Direction
 from .gatt import GattDatabase
-from .hci import CID_ATT, PSM_ATT, PSM_RFCOMM, Connection, L2capDecoder, L2capPdu
+from .hci import CID_ATT, PSM_ATT, PSM_AVCTP, PSM_AVDTP, PSM_RFCOMM, Connection, L2capDecoder, L2capPdu
 
 
 @dataclass(frozen=True)
 class Message:
-    """One unit of application data moving between the app and the device."""
+    """One unit of application data moving between the phone/PC and the device."""
 
     frame: int
     timestamp_us: int
     direction: Direction
     conn: int
-    channel: str  # "ATT 0x0012" or "RFCOMM ch1"
-    kind: str  # WRITE, WRITE-NR, NOTIFY, READ, UIH, ...
+    channel: str  # "ATT 0x0012", "RFCOMM ch1", "AVRCP", "AVDTP"
+    kind: str  # WRITE, WRITE-NR, NOTIFY, READ, UIH, AT, PASS, VENDOR, SIGNAL, ...
     handle: int | None
     data: bytes
+    note: str = ""  # decoded meaning for standard protocols (HFP, AVRCP, AVDTP)
 
 
 @dataclass
@@ -38,6 +40,10 @@ class Session:
     rfcomm: list[rfcomm.RfcommFrame] = field(default_factory=list)
     l2cap: list[L2capPdu] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
+    at_lines: list[tuple[Message, hfp.AtLine]] = field(default_factory=list)
+    avrcp: list[tuple[Message, avrcp.AvrcpMessage]] = field(default_factory=list)
+    avdtp: list[tuple[Message, avdtp.AvdtpSignal]] = field(default_factory=list)
+    media_packets: int = 0  # A2DP audio packets seen (not decoded)
 
     def address_of(self, conn: int) -> str:
         found = [c for c in self.connections if c.handle == conn]
@@ -49,6 +55,7 @@ class Session:
         direction: Direction | None = None,
         channel: int | None = None,
         kinds: set[str] | None = None,
+        name: str | None = None,
     ) -> list[Message]:
         out = []
         for m in self.messages:
@@ -60,41 +67,77 @@ class Session:
                 continue
             if kinds is not None and m.kind not in kinds:
                 continue
+            if name is not None and m.channel != name:
+                continue
             out.append(m)
         return out
 
 
 def decode(capture: Capture) -> Session:
     l2 = L2capDecoder()
-    session = Session(capture, l2.history, GattDatabase())
+    s = Session(capture, l2.history, GattDatabase())
     pending_reads: dict[tuple[int, Direction], int] = {}
+    avdtp_signaling: dict[tuple[int, Direction], int] = {}  # first AVDTP CID = signaling
+    at_channels: set[tuple[int, int]] = set()
     for pdu in l2.decode(capture.records):
-        session.l2cap.append(pdu)
+        s.l2cap.append(pdu)
         if pdu.cid == CID_ATT or pdu.psm == PSM_ATT:
-            a = att.parse(pdu.frame, pdu.timestamp_us, pdu.direction, pdu.handle, pdu.payload)
-            if a is None:
-                continue
-            session.att.append(a)
-            session.gatt.observe(a)
-            handle = a.handle
-            if a.opcode == att.Opcode.READ_REQ:
-                pending_reads[(a.conn, a.direction)] = a.handle
-            elif a.opcode in (att.Opcode.READ_RSP, att.Opcode.READ_BLOB_RSP):
-                handle = pending_reads.pop((a.conn, a.direction.opposite()), None)
-            if a.carries_data:
-                session.messages.append(
-                    Message(a.frame, a.timestamp_us, a.direction, a.conn, f"ATT {_h(handle)}", a.name, handle, a.value)
-                )
+            _on_att(s, pdu, pending_reads)
         elif pdu.psm == PSM_RFCOMM:
-            r = rfcomm.parse(pdu.frame, pdu.timestamp_us, pdu.direction, pdu.handle, pdu.payload)
-            if r is None:
+            _on_rfcomm(s, pdu, at_channels)
+        elif pdu.psm == PSM_AVCTP:
+            msg = avrcp.parse(pdu.payload)
+            if msg is not None:
+                kind = "PASS" if msg.opcode == avrcp.OP_PASS_THROUGH else "VENDOR" if msg.pdu is not None else "AV/C"
+                m = Message(pdu.frame, pdu.timestamp_us, pdu.direction, pdu.handle, "AVRCP", kind, None, pdu.payload, msg.describe())
+                s.messages.append(m)
+                s.avrcp.append((m, msg))
+        elif pdu.psm == PSM_AVDTP:
+            key = (pdu.handle, pdu.direction)
+            if avdtp_signaling.setdefault(key, pdu.cid) != pdu.cid:
+                s.media_packets += 1
                 continue
-            session.rfcomm.append(r)
-            if r.is_data:
-                session.messages.append(
-                    Message(r.frame, r.timestamp_us, r.direction, r.conn, f"RFCOMM ch{r.channel}", "UIH", None, r.payload)
-                )
-    return session
+            sig = avdtp.parse(pdu.payload)
+            if sig is not None:
+                m = Message(pdu.frame, pdu.timestamp_us, pdu.direction, pdu.handle, "AVDTP", "SIGNAL", None, pdu.payload, sig.describe())
+                s.messages.append(m)
+                s.avdtp.append((m, sig))
+    return s
+
+
+def _on_att(s: Session, pdu: L2capPdu, pending_reads: dict[tuple[int, Direction], int]) -> None:
+    a = att.parse(pdu.frame, pdu.timestamp_us, pdu.direction, pdu.handle, pdu.payload)
+    if a is None:
+        return
+    s.att.append(a)
+    s.gatt.observe(a)
+    handle = a.handle
+    if a.opcode == att.Opcode.READ_REQ:
+        pending_reads[(a.conn, a.direction)] = a.handle
+    elif a.opcode in (att.Opcode.READ_RSP, att.Opcode.READ_BLOB_RSP):
+        handle = pending_reads.pop((a.conn, a.direction.opposite()), None)
+    if a.carries_data:
+        s.messages.append(Message(a.frame, a.timestamp_us, a.direction, a.conn, f"ATT {_h(handle)}", a.name, handle, a.value))
+
+
+def _on_rfcomm(s: Session, pdu: L2capPdu, at_channels: set[tuple[int, int]]) -> None:
+    r = rfcomm.parse(pdu.frame, pdu.timestamp_us, pdu.direction, pdu.handle, pdu.payload)
+    if r is None:
+        return
+    s.rfcomm.append(r)
+    if not r.is_data:
+        return
+    key = (r.conn, r.channel)
+    if key not in at_channels and hfp.looks_like_at(r.payload):
+        at_channels.add(key)
+    if key in at_channels:
+        lines = hfp.split_lines(r.payload, from_headset=r.direction is Direction.RECEIVED)
+        note = " | ".join(f"{ln.text}" + (f"  ({d})" if (d := ln.describe()) else "") for ln in lines)
+        m = Message(r.frame, r.timestamp_us, r.direction, r.conn, f"RFCOMM ch{r.channel}", "AT", None, r.payload, note)
+        s.messages.append(m)
+        s.at_lines += [(m, ln) for ln in lines]
+    else:
+        s.messages.append(Message(r.frame, r.timestamp_us, r.direction, r.conn, f"RFCOMM ch{r.channel}", "UIH", None, r.payload))
 
 
 def _h(handle: int | None) -> str:

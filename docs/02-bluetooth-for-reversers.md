@@ -19,6 +19,9 @@ are AVRCP, so any OS can already send them (`playerctl`, media keys, `bluetoothc
 Battery is often exposed through the standard Battery Service (`0x180F`) or HFP. What the
 vendor app adds, and what you will be reverse engineering, is the rest: EQ presets, lights,
 party/stereo pairing, auto-off timers, voice prompts, button mapping, firmware updates.
+Devices without an app (many budget headphones) may have nothing but the standard
+profiles. In that case `rardex snoop features` audits which ones the device implements:
+codecs, absolute volume, battery reporting and buttons. Chapter 5 walks through one.
 
 ## The stack, and where the capture sits
 

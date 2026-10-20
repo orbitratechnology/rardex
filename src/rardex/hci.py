@@ -218,6 +218,21 @@ def build_le_connection_complete(handle: int, address: str) -> bytes:
     return bytes([EVT_LE_META, len(params)]) + params
 
 
+def build_connection_complete(handle: int, address: str) -> bytes:
+    """Classic (BR/EDR) Connection Complete event for an ACL link."""
+    params = struct.pack("<BH", 0x00, handle) + parse_address(address) + bytes([0x01, 0x00])
+    return bytes([EVT_CONNECTION_COMPLETE, len(params)]) + params
+
+
+def build_l2cap_connect(ident: int, psm: int, scid: int) -> bytes:
+    """Signaling-channel Connection Request; send on CID 0x0001."""
+    return struct.pack("<BBHHH", 0x02, ident, 4, psm, scid)
+
+
+def build_l2cap_connect_response(ident: int, dcid: int, scid: int) -> bytes:
+    return struct.pack("<BBHHHHH", 0x03, ident, 8, dcid, scid, 0, 0)
+
+
 def build_disconnection_complete(handle: int, reason: int = 0x13) -> bytes:
     params = struct.pack("<BHB", 0x00, handle, reason)
     return bytes([EVT_DISCONNECTION_COMPLETE, len(params)]) + params

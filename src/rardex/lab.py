@@ -14,10 +14,21 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 
-from . import att, checksum
+from . import att, avdtp, avrcp, checksum, rfcomm
 from .att import Opcode, uuid_to_le
 from .btsnoop import Direction, PacketType, Record
-from .hci import build_acl, build_disconnection_complete, build_le_connection_complete
+from .hci import (
+    CID_SIGNALING,
+    PSM_AVCTP,
+    PSM_AVDTP,
+    PSM_RFCOMM,
+    build_acl,
+    build_connection_complete,
+    build_disconnection_complete,
+    build_l2cap_connect,
+    build_l2cap_connect_response,
+    build_le_connection_complete,
+)
 
 ADDRESS = "C0:DE:52:44:58:01"
 CONN = 0x0041
@@ -254,4 +265,136 @@ def generate_capture(start_us: int = 1_792_490_400_000_000) -> list[Record]:
 
     w.wait(2.0)
     w.event(build_disconnection_complete(CONN))
+    return w.records
+
+
+# -- practice headset (classic Bluetooth, standard profiles only) ---------------------------
+
+HEADSET_ADDRESS = "C0:DE:52:44:58:02"
+HEADSET_CONN = 0x000C
+HEADSET_HFP_DLCI = 4  # server channel 2
+
+HEADSET_BRIEF = """\
+RARDEX LAB - audit the H-1 practice headset
+===========================================
+A fictional over-ear headset with no companion app: everything it does goes through
+standard profiles. The capture shows a phone connecting to it, playing music, a few
+headset button presses (play, next, previous, volume, a double press and a long press),
+and battery reports.
+
+  1. rardex snoop info LAB            which L2CAP protocols appear? (RFCOMM, AVDTP, AVCTP)
+  2. rardex snoop timeline LAB        AT commands, AVRCP and AVDTP are decoded inline
+  3. rardex snoop features LAB        the audit: codecs, absolute volume, battery, buttons
+Questions:
+  - Which codecs does the headset offer, and which did the phone choose?
+  - Can a computer set the headset's hardware volume? What is the evidence?
+  - How does it report battery, and in what steps?
+  - What does a double press send? A long press?
+Then compare with a capture of your own headset.
+"""
+
+
+def generate_headset_capture(start_us: int = 1_792_490_400_000_000) -> list[Record]:
+    """A phone <-> headset session using only HFP, A2DP and AVRCP."""
+    w = _CaptureWriter(start_us)
+    tx, rx = Direction.SENT, Direction.RECEIVED  # tx: phone -> headset
+    ident = iter(range(1, 256))
+
+    def l2(direction: Direction, cid: int, payload: bytes) -> None:
+        for packet in build_acl(HEADSET_CONN, cid, payload, max_fragment=1021):
+            w._add(direction, PacketType.ACL, packet)
+
+    def open_channel(psm: int, phone_cid: int, headset_cid: int) -> None:
+        i = next(ident)
+        l2(tx, CID_SIGNALING, build_l2cap_connect(i, psm, phone_cid))
+        l2(rx, CID_SIGNALING, build_l2cap_connect_response(i, headset_cid, phone_cid))
+
+    w.event(build_connection_complete(HEADSET_CONN, HEADSET_ADDRESS))
+
+    # HFP service level connection over RFCOMM (headset = HF, phone = AG).
+    open_channel(PSM_RFCOMM, 0x0040, 0x0041)
+    for dlci in (0, HEADSET_HFP_DLCI):
+        l2(tx, 0x0041, rfcomm.build_control(dlci, rfcomm.SABM, initiator=True))
+        l2(rx, 0x0040, rfcomm.build_control(dlci, rfcomm.UA, initiator=False))
+
+    def hf(command: str, *replies: str, gap: float = 0.03) -> None:
+        w.wait(gap)
+        l2(rx, 0x0040, rfcomm.build_uih(HEADSET_HFP_DLCI, f"{command}\r".encode(), initiator=False))
+        for reply in replies + ("OK",):
+            l2(tx, 0x0041, rfcomm.build_uih(HEADSET_HFP_DLCI, f"\r\n{reply}\r\n".encode(), initiator=True))
+
+    hf("AT+BRSF=415", "+BRSF: 3943")  # EC/NR, 3-way, CLI, VR, volume, codec negotiation, HF indicators
+    hf("AT+BAC=1,2")
+    hf("AT+CIND=?", '+CIND: ("call",(0,1)),("callsetup",(0-3)),("service",(0,1)),("signal",(0-5)),("battchg",(0-5))')
+    hf("AT+CIND?", "+CIND: 0,0,1,4,5")
+    hf("AT+CMER=3,0,0,1")
+    hf("AT+BIND=2")
+    hf("AT+BIND?", "+BIND: 2,1")
+    hf("AT+XAPL=FFFF-0001-0100,10", "+XAPL=iPhone,6")
+    hf("AT+IPHONEACCEV=1,1,7")
+    hf("AT+BIEV=2,80")
+    hf("AT+VGS=9")
+
+    # A2DP: discover endpoints, read capabilities, configure AAC, start streaming.
+    open_channel(PSM_AVDTP, 0x0042, 0x0043)
+    sbc = avdtp.capability(avdtp.CATEGORY_MEDIA_CODEC, bytes([0x00, 0x00, 0xFF, 0xFF, 0x02, 0x35]))
+    aac = avdtp.capability(avdtp.CATEGORY_MEDIA_CODEC, bytes([0x00, 0x02, 0x80, 0x01, 0x8C, 0x83, 0xE8, 0x00]))
+    transport, delay = avdtp.capability(0x01, b""), avdtp.capability(avdtp.CATEGORY_DELAY_REPORTING, b"")
+    exchanges = [
+        (avdtp.DISCOVER, b"", bytes([1 << 2, 0x08, 2 << 2, 0x08])),  # two audio sinks
+        (avdtp.GET_ALL_CAPABILITIES, bytes([1 << 2]), transport + sbc + delay),
+        (avdtp.GET_ALL_CAPABILITIES, bytes([2 << 2]), transport + aac + delay),
+        (avdtp.SET_CONFIGURATION, bytes([2 << 2, 1 << 2]) + transport + aac, b""),
+        (0x06, bytes([2 << 2]), b""),  # OPEN
+    ]
+    for label, (signal, command, response) in enumerate(exchanges, 1):
+        w.wait(0.02)
+        l2(tx, 0x0043, avdtp.build(label, 0, signal, command))
+        l2(rx, 0x0042, avdtp.build(label, 2, signal, response))
+    open_channel(PSM_AVDTP, 0x0044, 0x0045)  # media channel
+    l2(tx, 0x0043, avdtp.build(6, 0, 0x07, bytes([2 << 2])))  # START
+    l2(rx, 0x0042, avdtp.build(6, 2, 0x07, b""))
+
+    def audio(seconds: float) -> None:
+        for _ in range(int(seconds * 10)):
+            w.wait(0.1)
+            l2(tx, 0x0045, b"\x80\x60" + bytes(40))  # RTP header + payload (not decoded)
+
+    # AVRCP: phone checks volume support, registers for volume changes, sets volume.
+    open_channel(PSM_AVCTP, 0x0046, 0x0047)
+    label = iter(range(16))
+
+    def phone_vendor(ctype: int, pdu: int, params: bytes, reply_ctype: int, reply: bytes) -> None:
+        n = next(label) % 16
+        l2(tx, 0x0047, avrcp.build_vendor(n, ctype, pdu, params, response=False))
+        l2(rx, 0x0046, avrcp.build_vendor(n, reply_ctype, pdu, reply, response=True))
+
+    phone_vendor(0x1, avrcp.PDU_GET_CAPABILITIES, b"\x03", 0xC, bytes([0x03, 1, avrcp.EVENT_VOLUME_CHANGED]))
+    phone_vendor(0x3, avrcp.PDU_REGISTER_NOTIFICATION, bytes([avrcp.EVENT_VOLUME_CHANGED, 0, 0, 0, 0]), 0xF, bytes([avrcp.EVENT_VOLUME_CHANGED, 0x40]))
+    phone_vendor(0x0, avrcp.PDU_SET_ABSOLUTE_VOLUME, bytes([0x50]), 0x9, bytes([0x50]))
+    audio(2.0)
+
+    def button(op: int, gap: float = 2.5) -> None:
+        w.wait(gap)
+        n = next(label) % 16
+        for released in (False, True):
+            l2(rx, 0x0046, avrcp.build_pass_through(n, op, released))
+            l2(tx, 0x0047, avrcp.build_pass_through(n, op, released, response=True))
+            w.wait(0.08)
+
+    button(0x46)  # pause
+    button(0x44)  # play
+    audio(1.0)
+    button(0x4B)  # next
+    button(0x4C)  # previous
+    w.wait(2.0)  # volume +: headset changes its own volume and notifies the phone
+    l2(rx, 0x0046, avrcp.build_vendor(1, 0xD, avrcp.PDU_REGISTER_NOTIFICATION, bytes([avrcp.EVENT_VOLUME_CHANGED, 0x58]), response=True))
+    audio(1.0)
+    hf("AT+BLDN", gap=2.5)  # double press: redial
+    hf("AT+BVRA=1", gap=2.5)  # long press: voice assistant
+    hf("AT+IPHONEACCEV=1,1,6", gap=3.0)
+    hf("AT+BIEV=2,70")
+
+    w.wait(2.0)
+    w.event(build_disconnection_complete(HEADSET_CONN))
     return w.records

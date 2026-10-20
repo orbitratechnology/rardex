@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from . import analyze as analysis
-from . import btsnoop, checksum, lab
+from . import bluez, btsnoop, checksum, features, lab
 from .att import describe_error, Opcode
 from .btsnoop import Direction
 from .client import SpeakerClient, make_transport
@@ -98,6 +98,8 @@ def cmd_snoop_gatt(args: argparse.Namespace) -> None:
 
 
 def _annotate(s: Session, m: Message, proto: Protocol | None) -> str:
+    if m.note:
+        return m.note
     if proto is not None:
         found = proto.identify(m.data)
         if found:
@@ -137,6 +139,10 @@ def cmd_snoop_timeline(args: argparse.Namespace) -> None:
             f"{fmt_seconds(m.timestamp_us - t0):>10}  {m.frame:>6}  {m.direction.arrow}   "
             f"{m.channel:<12} {m.kind:<9} {len(m.data):>4}  {data:<{pad}} {note}"
         )
+
+
+def cmd_snoop_features(args: argparse.Namespace) -> None:
+    print(features.format_report(features.audit(_load_session(args.file))))
 
 
 def cmd_snoop_export(args: argparse.Namespace) -> None:
@@ -324,14 +330,68 @@ async def _ctl(args: argparse.Namespace) -> None:
             print(f"  {line}")
 
 
+# -- headset (Linux / BlueZ) ---------------------------------------------------------------
+
+
+def cmd_headset_info(args: argparse.Namespace) -> None:
+    h = bluez.Bluez().find(args.device)
+    print(f"{h.name}  [{h.address}]  {'connected' if h.connected else 'not connected'}")
+    print("profiles advertised:")
+    for p in h.profiles:
+        print(f"  {p}")
+    if h.battery is not None:
+        print(f"battery: {h.battery}%")
+    else:
+        print("battery: not reported to BlueZ (see docs/05 for how headsets report it)")
+    if not h.transports:
+        print("audio: no A2DP transport right now (connect it and play something)")
+    for t in h.transports:
+        codec = bluez.A2DP_CODECS.get(t.get("Codec"), t.get("Codec"))
+        volume = f"{t['Volume']}/127" if "Volume" in t else "none (no AVRCP absolute volume)"
+        print(f"audio: codec {codec}, state {t.get('State')}, hardware volume {volume}")
+
+
+def cmd_headset_volume(args: argparse.Namespace) -> None:
+    bz = bluez.Bluez()
+    h = bz.find(args.device)
+    if args.level is None:
+        t = h.volume_transport
+        print(f"{t['Volume']}/127 (~{round(t['Volume'] * 100 / 127)}%)" if t else "no hardware volume exposed")
+        return
+    level = round(args.level * 127 / 100) if args.percent else args.level
+    bz.set_volume(h, level)
+    print(f"hardware volume set to {level}/127")
+
+
+def cmd_headset_inputs(_args: argparse.Namespace) -> None:
+    for path, name in bluez.input_devices():
+        print(f"{path}  {name}")
+
+
+def cmd_headset_buttons(args: argparse.Namespace) -> None:
+    path = args.input or bluez.find_input_device(args.name or bluez.Bluez().find(args.device).name)
+    mapper = bluez.ButtonMapper(_kv(args.map or []))
+    with bluez.open_input(path) as fh:
+        if args.grab:
+            bluez.grab(fh.fileno())
+        print(f"listening on {path}; press headset buttons (Ctrl+C to stop)", flush=True)
+        try:
+            for event in bluez.read_key_events(fh):
+                ran = mapper.handle(event)
+                print(f"{event.key:<18} {event.action}" + (f"  -> ran: {ran}" if ran else ""), flush=True)
+        except KeyboardInterrupt:
+            pass
+
+
 def cmd_lab_capture(args: argparse.Namespace) -> None:
-    btsnoop.save(args.output, lab.generate_capture())
+    records = lab.generate_headset_capture() if args.headset else lab.generate_capture()
+    btsnoop.save(args.output, records)
     print(f"wrote practice capture to {args.output}")
-    print("next: rardex lab brief")
+    print("next: rardex lab brief" + (" --headset" if args.headset else ""))
 
 
-def cmd_lab_brief(_args: argparse.Namespace) -> None:
-    print(lab.BRIEF)
+def cmd_lab_brief(args: argparse.Namespace) -> None:
+    print(lab.HEADSET_BRIEF if args.headset else lab.BRIEF)
 
 
 # -- parser --------------------------------------------------------------------------------
@@ -359,6 +419,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ascii", action="store_true", help="also show printable ASCII")
     p.add_argument("--protocol", help="protocol file to name known commands/responses")
     p.set_defaults(func=cmd_snoop_timeline)
+    p = snoop.add_parser("features", help="headset audit: codecs, absolute volume, battery, buttons (HFP/A2DP/AVRCP)")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_snoop_features)
     p = snoop.add_parser("export", help="write one hex frame per line for `rardex analyze`")
     p.add_argument("file")
     p.add_argument("--handle", type=_int)
@@ -415,13 +478,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--listen", type=float, default=0.0, help="keep listening N seconds for notifications")
     p.set_defaults(func=lambda a: asyncio.run(_ctl(a)))
 
-    labp = sub.add_parser("lab", help="practice target: a virtual speaker and its capture").add_subparsers(
+    hs = sub.add_parser("headset", help="control a connected headset via Linux BlueZ (standard profiles)").add_subparsers(
         dest="sub", required=True
     )
-    p = labp.add_parser("capture", help="write the practice btsnoop capture")
+    p = hs.add_parser("info", help="profiles, battery, codec and hardware-volume support")
+    p.add_argument("--device", help="address or name substring (default: the one connected device)")
+    p.set_defaults(func=cmd_headset_info)
+    p = hs.add_parser("volume", help="read or set hardware volume (AVRCP absolute volume)")
+    p.add_argument("level", nargs="?", type=int, help="0..127, or 0..100 with --percent")
+    p.add_argument("--percent", action="store_true")
+    p.add_argument("--device")
+    p.set_defaults(func=cmd_headset_volume)
+    p = hs.add_parser("inputs", help="list Linux input devices (find the headset's button device)")
+    p.set_defaults(func=cmd_headset_inputs)
+    p = hs.add_parser("buttons", help="show headset button presses and map them to commands")
+    p.add_argument("--input", help="/dev/input/eventN (default: found by headset name)")
+    p.add_argument("--name", help="input device name substring (default: headset name from BlueZ)")
+    p.add_argument("--device", help="headset address or name substring for BlueZ lookup")
+    p.add_argument("--map", action="append", metavar="KEY=COMMAND", help='e.g. KEY_NEXTSONG="notify-send next"')
+    p.add_argument("--grab", action="store_true", help="exclusive: the desktop stops seeing these buttons")
+    p.set_defaults(func=cmd_headset_buttons)
+
+    labp = sub.add_parser("lab", help="practice targets: a virtual speaker/headset and captures").add_subparsers(
+        dest="sub", required=True
+    )
+    p = labp.add_parser("capture", help="write a practice btsnoop capture")
     p.add_argument("output")
+    p.add_argument("--headset", action="store_true", help="the classic-Bluetooth headset (HFP/A2DP/AVRCP)")
     p.set_defaults(func=cmd_lab_capture)
     p = labp.add_parser("brief", help="print the exercise")
+    p.add_argument("--headset", action="store_true")
     p.set_defaults(func=cmd_lab_brief)
     return ap
 
@@ -433,7 +519,7 @@ def main(argv: list[str] | None = None) -> None:
     except BrokenPipeError:
         # Output piped into `head` etc.; exit quietly like other Unix tools.
         sys.stdout = open(os.devnull, "w")
-    except (ProtocolError, TransportError, btsnoop.BtsnoopError, ValueError, OSError) as exc:
+    except (ProtocolError, TransportError, bluez.BluezError, btsnoop.BtsnoopError, ValueError, OSError) as exc:
         raise SystemExit(f"error: {exc}") from None
 
 
