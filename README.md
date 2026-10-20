@@ -1,0 +1,143 @@
+# rardex
+
+**Reverse engineer your Bluetooth speaker's app protocol, then control it with your own software.**
+
+The vendor app can set the EQ, change the lights or set an auto-off timer, and your laptop
+can't. rardex helps you close that gap on hardware you own:
+
+1. **Decode** the phone's Bluetooth HCI snoop log (btsnoop): HCI → L2CAP → ATT/GATT and
+   RFCOMM/SPP, including fragment reassembly and GATT handle → UUID mapping.
+2. **Infer** the frame format from samples: sync prefix, length field, checksum
+   (brute-forced against 12 common algorithms, with odds of a chance match), command ids,
+   argument bytes and slider-like controls.
+3. **Describe** the protocol in a small TOML file, then prove it: rebuild captured frames
+   byte for byte and check that it identifies every frame in a capture.
+4. **Control** the speaker over BLE (via `bleak`) or classic RFCOMM, from the CLI or Python.
+
+Pure Python 3.11+, no required dependencies. A built-in **practice speaker** lets you run
+the whole workflow without hardware.
+
+## Learn
+
+The `docs/` folder is a short course. It distills the method of two reverse engineering
+projects, [REA](https://github.com/morluto/rea) and
+[leanrea](https://github.com/aicodeking/leanrea), and applies it to Bluetooth devices.
+
+1. [Reverse engineering primer](docs/01-reverse-engineering-primer.md): evidence
+   discipline (seen / derived / inferred / unknown), cheapest-inventory-first, diff before
+   decode, and proving a rebuild against the original.
+2. [Bluetooth for reverse engineers](docs/02-bluetooth-for-reversers.md): what's standard
+   (A2DP/AVRCP), where vendor bytes live (GATT or SPP), and common frame shapes.
+3. [Speaker playbook](docs/03-speaker-playbook.md): capture plan, Android HCI snoop
+   logging, decode → infer → verify → control, and troubleshooting.
+4. [Protocol notebook template](docs/04-protocol-notebook.md): where findings and their
+   evidence go.
+
+## Try it in two minutes (no hardware)
+
+```sh
+pip install -e .                      # or: export PYTHONPATH=src and use python -m rardex
+rardex lab capture lab.btsnoop        # practice capture: app <-> fictional RX-1 speaker
+rardex lab brief                      # the exercise
+rardex snoop info lab.btsnoop
+rardex snoop gatt lab.btsnoop
+rardex snoop export lab.btsnoop --handle 0x0012 -o tx.txt
+rardex analyze tx.txt
+```
+
+`analyze` on the practice capture:
+
+```text
+common prefix: a5 5a   <- likely a sync/header marker
+length field:
+  candidate: u8 at offset 2 = frame length -4
+checksum:
+  candidate: sum8_neg over frame[2:-1]
+  candidate: sum8_not over frame[0:-1]
+  (60 combinations tried on 22 distinct frames; expected chance matches ~2.5e-52)
+command id (inferred): byte at offset 3; frames grouped by it:
+  [0x02] x12  a5 5a 02 02 ?? ??
+         offset  4: 09 0a 0b 0c 0d 0e 0f 10
+         slider? offset 4 moves in steps of 1 within 9..16 (like a volume/brightness control)
+  ...
+```
+
+Then write `rx1.toml` from [`protocols/template.toml`](protocols/template.toml) and drive
+the virtual speaker:
+
+```sh
+rardex proto verify rx1.toml tx.txt                  # "27/27 frames identified"
+rardex ctl rx1.toml --lab volume level=20 , eq preset=party , status
+```
+
+(A worked solution is in `tests/fixtures/lab_solution.toml`. Try the exercise first.)
+
+## Use it on your speaker
+
+```sh
+pip install -e '.[ble]'
+rardex scan --name JBL                               # find it
+rardex gatt AA:BB:CC:DD:EE:FF --read                 # its live GATT table
+# capture with Android's HCI snoop log while using the vendor app (see the playbook)
+rardex snoop info btsnoop_hci.log
+rardex snoop timeline btsnoop_hci.log --gap 2
+rardex snoop export btsnoop_hci.log --handle 0x0012 --direction tx -o tx.txt
+rardex analyze tx.txt
+rardex proto build protocols/mine.toml volume level=9 --compare "<captured frame>"
+rardex ctl protocols/mine.toml --address AA:BB:CC:DD:EE:FF volume level=12 --listen 2
+```
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `snoop info FILE` | Datalink, connections, protocols, busiest app-data channels |
+| `snoop gatt FILE` | GATT table rebuilt from discovery; marks where the app writes / device notifies |
+| `snoop timeline FILE` | App data in time order, split at pauses; `--protocol` names known frames |
+| `snoop export FILE` | One hex frame per line (`--handle`, `--channel`, `--direction tx/rx`) |
+| `analyze [FILES]` | Prefix, length field, checksum, command ids, per-command masks, sliders |
+| `checksum HEX...` | Which algorithm/range explains these frames, with false-match odds |
+| `diff A B` | Byte-level diff of two frames |
+| `proto show/build/verify` | Inspect a protocol file, build frames (`--compare`), check coverage |
+| `scan`, `gatt ADDR` | Live BLE discovery and GATT enumeration (needs `rardex[ble]`) |
+| `ctl PROTO CMD k=v [, CMD ...]` | Send commands (`--address`, `--raw HEX`, `--listen`, `--lab`) |
+| `lab capture/brief` | Practice capture and exercise |
+
+Input formats: btsnoop H4 (Android), H1, and Linux `btmon -w` monitor captures.
+
+## Layout
+
+```
+src/rardex/
+  btsnoop.py   btsnoop reader/writer          hci.py      HCI events, ACL/L2CAP reassembly
+  att.py       ATT PDUs and UUIDs             gatt.py     GATT table from discovery traffic
+  rfcomm.py    RFCOMM frames (SPP)            session.py  all layers -> app-data messages
+  checksum.py  checksum zoo + detector        analyze.py  frame-structure inference
+  protocol.py  TOML protocol files            client.py   SpeakerClient, stream reassembly
+  transport.py BLE / RFCOMM / lab transports  lab.py      practice speaker + capture
+  cli.py       the rardex command
+protocols/template.toml   start here for your speaker
+docs/                     the course
+tests/                    python -m unittest discover -s tests
+```
+
+## Responsible use
+
+Use this with devices you own, to make them work with your software. Prefer replaying
+observed frames over guessing new ones, and don't write to firmware-update services
+(`snoop gatt` labels common ones). Keep captures private: HCI logs can contain addresses
+and traffic from every Bluetooth device the phone talked to, so `.gitignore` excludes them.
+
+## Tests
+
+```sh
+PYTHONPATH=src python -m unittest discover -s tests
+```
+
+The tests cover each decoding layer (with reference values such as the RFCOMM FCS and
+standard CRC check values) and the full lab workflow from capture to control. Live BLE and
+RFCOMM transports are not exercised by the tests, because they need real hardware.
+
+## License
+
+MIT

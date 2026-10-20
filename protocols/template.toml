@@ -1,0 +1,64 @@
+# Protocol file template. Copy to protocols/<brand>-<model>.toml and fill it in as you learn.
+# Every value here should be backed by evidence in your notebook (docs/04-protocol-notebook.md).
+#
+# Check your work:
+#   rardex proto show     protocols/x.toml
+#   rardex proto build    protocols/x.toml volume level=9 --compare "<frame from capture>"
+#   rardex proto verify   protocols/x.toml tx.txt         # every captured frame explained?
+#   rardex snoop timeline capture.log --protocol protocols/x.toml   # names known frames
+
+[device]
+name = "Brand Model"
+transport = "ble"                # "ble" (GATT) or "rfcomm" (classic serial port / SPP)
+# address = "AA:BB:CC:DD:EE:FF"  # optional; --address overrides it
+
+# BLE: from `rardex snoop gatt` ("APP WRITES HERE" / "DEVICE NOTIFIES HERE")
+write_uuid = "0000ffe1-0000-1000-8000-00805f9b34fb"
+notify_uuid = "0000ffe1-0000-1000-8000-00805f9b34fb"
+write_with_response = false      # true if the capture shows WRITE (0x12), false for WRITE-NR (0x52)
+
+# RFCOMM: the server channel from `rardex snoop info` ("RFCOMM chN") or `sdptool browse`
+# channel = 1
+
+[framing]
+# Frame = prefix | length | payload | checksum | suffix  (leave out what the device lacks)
+prefix = "aa 55"                 # constant sync bytes at the start of every frame
+suffix = ""                      # constant end marker, if any
+
+# What `rardex analyze` reported as the length field. covers = "payload" | "payload+checksum" | "all"
+# adjust is added after counting, e.g. a length that also counts its command byte twice.
+length = { type = "u8", covers = "payload", adjust = 0 }
+
+# What `rardex analyze` / `rardex checksum` reported.
+# algorithms: sum8 sum8_neg sum8_not xor8 crc8 crc8_maxim sum16 crc16_modbus crc16_arc
+#             crc16_kermit crc16_ccitt_false crc16_xmodem
+# covers = "payload" | "length+payload" | "all" (everything before the checksum)
+checksum = { algorithm = "sum8", covers = "length+payload", byteorder = "little" }
+
+# Commands: payload templates. Hex bytes are constants, {name:type} are arguments.
+# types: u8 i8 u16le u16be i16le i16be u32le u32be bool
+[commands.power]
+payload = "01 {on:bool}"
+description = "power on/off"
+
+[commands.volume]
+payload = "02 {level:u8}"
+description = "absolute volume"
+args = { level = { min = 0, max = 31 } }   # use the range you OBSERVED; don't guess beyond it
+
+[commands.eq]
+payload = "03 {preset:u8}"
+args = { preset = { choices = { flat = 0, bass = 1 } } }
+
+# Responses: how to recognize device -> app frames. "??" matches any byte.
+# fields: name = "type@offset" with offsets into the whole frame (prefix included).
+[[responses]]
+name = "ack"
+match = "aa 55 ?? 80"
+fields = { command = "u8@4" }
+
+[[responses]]
+name = "status"
+match = "aa 55 ?? 81"
+fields = { volume = "u8@4", battery = "u8@5" }
+labels = { }                     # e.g. labels = { eq = { "0" = "flat", "1" = "bass" } }

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Captures and bug reports can contain addresses and traffic from every nearby/paired device.
+captures/
+*.btsnoop
+*.log
+*.pklg
+*.pcap
+*.pcapng
+bugreport*.zip
+tx.txt
+rx.txt

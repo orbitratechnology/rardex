@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rardex"
+version = "0.1.0"
+description = "Reverse engineer and control Bluetooth speakers: btsnoop decoding, protocol inference, and a declarative control client."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+ble = ["bleak>=0.22"]
+
+[project.scripts]
+rardex = "rardex.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

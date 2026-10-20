@@ -1,0 +1,48 @@
+# SPOILER: solution for the `rardex lab` exercise (the fictional RX-1 practice speaker).
+# Used by the test suite. Try the exercise before reading this.
+
+[device]
+name = "RARDEX Lab RX-1"
+transport = "ble"
+write_uuid = "52440002-4c41-4221-8000-726172646578"
+notify_uuid = "52440003-4c41-4221-8000-726172646578"
+write_with_response = false
+
+[framing]
+prefix = "a5 5a"
+length = { type = "u8", covers = "payload" }
+checksum = { algorithm = "sum8_neg", covers = "length+payload" }
+
+[commands.power]
+payload = "01 {on:bool}"
+
+[commands.volume]
+payload = "02 {level:u8}"
+args = { level = { min = 0, max = 31 } }
+
+[commands.eq]
+payload = "03 {preset:u8}"
+args = { preset = { choices = { flat = 0, bass = 1, vocal = 2, party = 3 } } }
+
+[commands.light]
+payload = "04 {mode:u8} {r:u8} {g:u8} {b:u8}"
+args = { mode = { choices = { off = 0, solid = 1, pulse = 2 } }, r = { default = 0 }, g = { default = 0 }, b = { default = 0 } }
+
+[commands.status]
+payload = "05"
+
+[commands.auto_off]
+payload = "06 {minutes:u16le}"
+args = { minutes = { min = 0, max = 720 } }
+
+[[responses]]
+name = "ack"
+match = "a5 5a 03 80"
+fields = { command = "u8@4", result = "u8@5" }
+labels = { result = { "0" = "ok", "1" = "unknown-command", "2" = "bad-argument" } }
+
+[[responses]]
+name = "status"
+match = "a5 5a 06 85"
+fields = { power = "u8@4", volume = "u8@5", eq = "u8@6", battery = "u8@7", charging = "u8@8" }
+labels = { eq = { "0" = "flat", "1" = "bass", "2" = "vocal", "3" = "party" } }
