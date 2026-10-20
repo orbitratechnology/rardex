@@ -46,10 +46,10 @@ with every capture finding they overlap.
 | 16 | No AVDTP delay reporting (affects video lip-sync compensation) | seen | no delay-reporting capability in C; D `Delay Reporting: 0` |
 | 17 | Hardware volume (AVRCP absolute volume) is supported | seen | headset ACCEPTED SetAbsoluteVolume, C frames 569, 1579, 1593, 1609, 3606; D `AbsVol: true` |
 | 18 | Headset volume buttons change the **headset's own volume** in steps of 8 on a 0-127 scale: **17 levels** (0, 8 … 120, 127) | seen / derived | 72 VOLUME_CHANGED notifications in C, steps 8×66, 7×2; D shows the same 56→0→56 run |
-| 19 | Volume buttons do **not** send key presses (no AVRCP volume up/down pass-through) | seen in C | 0 volume pass-through commands vs 72 VOLUME_CHANGED |
-| 20 | Track buttons send AVRCP pass-through **play, pause, next, previous** (separate play and pause, not a toggle) | seen | C: play ×4, pause ×4, next ×8, previous ×5; D media key log (ids 68/70/75/76) |
-| 21 | Next/previous are **long presses of the volume buttons** | seen | confirmed by owner; 11 of 13 skips in C have no volume change in the 2 s before |
-| 22 | Which volume button gives next vs previous | **unknown** | a weak guess (volume− = previous) is contradicted: volume rose before the 01:13:02 "previous" but fell before the 01:10:18 one |
+| 19 | Volume changes do **not** send key presses (no AVRCP volume up/down pass-through) | seen in C | 0 volume pass-through commands vs 72 VOLUME_CHANGED |
+| 20 | Skip and playback controls send AVRCP pass-through **play, pause, next, previous** (separate play and pause, not a toggle) | seen | C: play ×4, pause ×4, next ×8, previous ×5; D media key log (ids 68/70/75/76) |
+| 21 | Button layout: Up short = volume+, Up long = **next**; Down short = volume−, Down long = **previous** | seen | owner; consistent with C (skips arrive as pass-through, volume changes as VOLUME_CHANGED, 11 of 13 skips have no volume step in the 2 s before) |
+| 22 | The capture alone could not tell which button a skip came from | method note | the volume fell before the 01:10:18 "previous" and rose before the 01:13:02 one: that is just whatever the user did last. An early guess (Down long = previous) turned out right, and a later "contradicted" reading of the same data was wrong; neither had discriminating evidence |
 | 23 | Every button event is sent as a complete click: press and release only 14-93 ms apart | seen | C, all 21 presses |
 | 24 | The headset recognizes the gesture (short vs long press) itself and sends the result | inferred | #23: a held button cannot produce a 14 ms press on the wire |
 | 25 | The headset subscribes to the phone's PLAYBACK_STATUS_CHANGED, presumably to choose play vs pause | seen / inferred | C, 24 RegisterNotification commands; D registered notifications: "Play Status" |
@@ -57,6 +57,8 @@ with every capture finding they overlap.
 | 27 | The headset does its own echo cancelling / noise reduction | inferred | `AT+NREC=0` (asks the phone to turn off its own); BRSF EC/NR bit |
 | 28 | Battery is reported only via Apple's `AT+IPHONEACCEV` (0-9, ~10% steps), each report sent twice | seen | A frame 3737/3738; C frames 488/489, 1017, 3572/3575 |
 | 29 | Battery jumped from 0/9 to 7/9 between A and C because it was charged while switched off | seen | owner confirmed; B's page timeouts match the headset being off |
+| 29a | The phone shows the D02 Pro's battery percentage | seen | owner |
+| 29b | That percentage comes from `AT+IPHONEACCEV`, so it moves in ~10% steps | inferred | it is the only battery report in A-C (#26: no HF indicators; D: BLE Battery profile not used, policy `BATTERY=-1`) |
 | 30 | `AT+XAPL=ABCD-1234-0100,10` uses placeholder vendor/product ids | inferred | literal `ABCD-1234`; the real ids are #2 and #4 |
 | 31 | The headset asks the phone's manufacturer (`AT+CGMI?`) on every connection | seen | A frame 3710, C frames 447, 3526 |
 | 32 | Vendor command `AT+VDSF=1`, rejected by the phone (`+CME ERROR: 0`) | seen; meaning **unknown** | A frame 3745, C frames 500, 3589; no public documentation found |
@@ -77,14 +79,11 @@ precedes Android's media-key log entry by 34 ms. With the clocks aligned:
 - the **volume run** in D (56, 48 … 0 … 48, 56) is identical to C's VOLUME_CHANGED sequence;
 - D's controller identity (`remote_info:12-08891-01494`) equals C's Read Remote Version event.
 
-One earlier inference did *not* survive the second look: #22, which volume button skips which way.
+What neither source could settle is which button skips which way (#22). The owner's direct
+description (#21) did.
 
 ### Open questions
 
-- **Which volume button skips which way** (#22): one long press of volume+, a pause, then
-  volume−, watched with `rardex headset buttons` or captured, settles it.
-- **Does Android show the battery level** for the D02 Pro in Bluetooth settings? D shows the
-  phone answering `OK` to the battery reports but doesn't record the level it shows.
 - **Battery accuracy**: after charging (#29) it read 7/9, then 6/9 after 26 s and 5/9 after
   about 3.5 min. That suggests a voltage-based estimate that sags after charging (inferred).
 - **The 01:11:13 link loss** (C): audio had paused at 01:11:01.9 and the link went to sniff mode
@@ -99,10 +98,10 @@ One earlier inference did *not* survive the second look: #22, which volume butto
 | Feature | Works? | How |
 |---|---|---|
 | Hardware volume | yes (#17, #18) | `rardex headset volume 64`; prefer multiples of 8, the headset's own steps |
-| Battery level | yes, 10% steps (#28) | `rardex headset info`, if the audio server forwards Apple battery reports to BlueZ |
-| Play/pause/next/previous buttons | yes (#20) | `rardex headset buttons --map ...` (BlueZ turns them into key events) |
-| Long-press volume (next/previous) as custom actions | yes, cleanly (#21, #23) | they arrive as next/previous keys with no stray volume step first |
-| Short-press volume as custom actions | no (#19) | they change the headset volume itself; Linux sees a transport `Volume` change, not a key |
+| Battery level | yes, 10% steps (#28, #29b) | Android already shows it; on Linux `rardex headset info`, if the audio server forwards Apple battery reports to BlueZ |
+| Play/pause/next/previous | yes (#20) | `rardex headset buttons --map ...` (BlueZ turns them into key events) |
+| Up long (next) / Down long (previous) as custom actions | yes, cleanly (#21, #23) | they arrive as next/previous keys with no stray volume step first |
+| Up short (volume+) / Down short (volume−) as custom actions | no (#19) | they change the headset volume itself; Linux sees a transport `Volume` change, not a key |
 | Custom gestures (double/triple press, hold durations) | no (#24) | the headset decides the gesture; software only sees the result |
 | Call buttons | partly | HFP AT commands to the phone/audio stack; not visible to `headset buttons` |
 | Audio quality | AAC 44.1 kHz VBR if available (#14, #15) | on Linux, AAC needs an AAC-capable audio server build; otherwise SBC at bitpool ≤ 38 |
@@ -161,6 +160,11 @@ Real captures exposed things that the synthetic tests had not:
 4. **Missing audio isn't missing streaming.** The phone offloads A2DP to its chip (#35), so the
    log shows the stream starting but never the audio. The audit now says so instead of
    staying silent.
-5. **A second source catches weak inferences.** Lining up Android's `dumpsys` with the capture
-   confirmed most findings independently, and it also refuted one guess (#22). Weak evidence
-   such as "what happened just before" should stay labeled weak until a controlled test runs.
+5. **A second source confirms, but only discriminating evidence decides.** Lining up Android's
+   `dumpsys` with the capture confirmed most findings independently. For the button layout,
+   though, "which volume step came just before the skip" was read first as support for a
+   guess and then as its refutation. Both readings were overconfident, because that evidence
+   can't tell the buttons apart (#22). A direct, controlled observation settled it (#21).
+6. **Derived claims inherit their premises.** A timing test was designed from a first, mistaken
+   description of the buttons. When the owner corrected the description, the test lost its
+   meaning and was dropped instead of being kept as a "finding".
