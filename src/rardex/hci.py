@@ -41,10 +41,11 @@ PSM_NAMES = {
     0x0013: "HID-interrupt",
 }
 
-# ACL handles that carry controller diagnostics instead of a device link. Android snoop logs
-# commonly contain ACL traffic on 0x0EDC that no Connection Complete event ever opens and that
-# only flows controller -> host. It is the phone's Bluetooth chip talking about itself, not a
-# remote device, so it is kept out of L2CAP decoding and counted separately.
+# ACL handles that carry controller diagnostics instead of a device link. Seen in snoop logs
+# from a Qualcomm-based Android phone: ACL traffic on 0x0EDC that no Connection Complete event
+# ever opens, flowing only controller -> host, with payloads matching no protocol. That points
+# to the phone's Bluetooth chip reporting about itself (inferred), so the handle is kept out of
+# L2CAP decoding and counted separately unless a connection event really opens it.
 DIAGNOSTIC_HANDLES = {0x0EDC}
 
 # HCI event codes we decode.

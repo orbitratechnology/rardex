@@ -74,6 +74,19 @@ and one variable changes at a time:
    by vendor and Android version).
 6. Turn snoop logging off again when you're done.
 
+What else in the bug report is useful (and what isn't):
+
+- **Useful:** the main `bugreport-*.txt` section `DUMP OF SERVICE bluetooth_manager`. This
+  is Android's own view of each device: bonded devices, profile states, the A2DP codec
+  configuration and the codecs it could select, AVRCP absolute-volume state, and the battery
+  level the phone last received. It's a good cross-check for `rardex snoop features`.
+  Extract it with
+  `unzip -p bugreport.zip 'bugreport-*.txt' | sed -n '/DUMP OF SERVICE bluetooth_manager/,/^DUMP OF SERVICE /p' > bt-dumpsys.txt`.
+  It names *every* paired device, so review it before sharing.
+- **Rarely useful:** per-HAL debug files such as `...IBluetoothHci_default.txt`. These are
+  vendor driver dumps and are often empty, or only say that a dump directory doesn't exist.
+  An empty dump means "not collected", not "nothing happened".
+
 Alternatives:
 
 - **Linux host:** `sudo btmon -w capture.btsnoop` records the BlueZ stack, for example

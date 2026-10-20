@@ -117,7 +117,9 @@ Real captures exposed three things that the synthetic tests had not:
 1. **Controller diagnostics on ACL handle 0x0EDC.** About half of every capture was ACL
    traffic on a handle that no connection event ever opened, flowing only controller → host,
    with payloads that match no protocol. Decoding it as L2CAP produced hundreds of fake
-   "channels". rardex now counts it separately (`snoop info` → `acl handles`).
+   "channels". rardex now counts it separately (`snoop info` → `acl handles`). The phone is
+   Qualcomm-based (its bug report lists `vendor.qti` HALs and a Qualcomm `ssrdump` path), so
+   this is seen for that platform. Whether other chipsets use the same handle is unknown.
 2. **Failed connections hide in plain sight.** Capture B looked empty. In fact it held four
    `Connection Complete` events with status `0x04 page timeout`. rardex used to ignore failed
    events; `snoop info` now lists them. This is the primer's rule in action: no data is
