@@ -67,6 +67,8 @@ COMMANDS = {
     "AT+CLIP": "caller ID on/off",
     "AT+CCWA": "call waiting on/off",
     "AT+NREC": "noise reduction/echo cancel",
+    "AT+CGMI": "asks the phone's manufacturer",
+    "AT+CGMM": "asks the phone's model",
     "AT+VGS": "speaker volume (0-15)",
     "AT+VGM": "mic gain (0-15)",
     "AT+BVRA": "voice assistant",
@@ -153,6 +155,8 @@ class AtLine:
                 return f"indicator {HF_INDICATORS.get(int(args[0]), args[0])} = {args[1]}"
             if cmd == "AT+BVRA" and args:
                 return "voice assistant " + ("start" if args[0] == "1" else "stop")
+            if cmd == "AT+NREC" and args == ["0"]:
+                return "asks the phone to turn off its echo cancel/noise reduction (headset does its own)"
             if cmd == "AT+CKPD":
                 return "HSP button press"
         except (ValueError, IndexError):
@@ -174,6 +178,19 @@ class AtLine:
         except ValueError:
             return None
         return None
+
+
+# Result codes and commands defined by HFP/HSP (or Apple's published extension). Anything else
+# a headset sends is vendor-specific and worth a closer look.
+STANDARD = set(COMMANDS) | {
+    "OK", "ERROR", "RING", "+CME ERROR", "+BRSF", "+CIND", "+CIEV", "+CHLD", "+CLIP", "+CCWA",
+    "+VGS", "+VGM", "+BSIR", "+BVRA", "+BCS", "+BIND", "+BIEV", "+XAPL", "+CLCC", "+COPS",
+    "+CNUM", "+BTRH", "+CGMI", "+CGMM", "AT+CGMR", "+CGMR",
+}
+
+
+def is_standard(command: str) -> bool:
+    return command in STANDARD or command.startswith("ATD")
 
 
 def looks_like_at(data: bytes) -> bool:

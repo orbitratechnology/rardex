@@ -11,13 +11,14 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
-from . import avrcp, hfp
+from . import avrcp, hfp, sdp
 from .avdtp import DISCOVER, GET_ALL_CAPABILITIES, GET_CAPABILITIES, SET_CONFIGURATION, Endpoint
 from .btsnoop import Direction
-from .session import Session
+from .session import Message, Session
 
 FROM_HEADSET = Direction.RECEIVED  # snoop logs are recorded on the phone/PC side
 HEADSET_CALL_COMMANDS = {"ATA", "AT+CHUP", "AT+BLDN", "AT+BVRA", "ATD", "AT+CKPD"}
+HANDSHAKE_COMMANDS = {"AT+BRSF", "+BRSF", "AT+BAC", "AT+XAPL", "AT+BIND", "+BCS", "AT+NREC", "AT+CGMI", "AT+CGMM"}
 
 
 @dataclass
@@ -35,6 +36,7 @@ class HeadsetReport:
     devices: list[str] = field(default_factory=list)
     profiles: dict[str, Evidence] = field(default_factory=dict)
     hfp: list[Evidence] = field(default_factory=list)
+    nonstandard: list[Evidence] = field(default_factory=list)
     battery: list[tuple[float, int, str, int]] = field(default_factory=list)  # (t, %, source, frame)
     hfp_volume: list[Evidence] = field(default_factory=list)
     call_buttons: list[Evidence] = field(default_factory=list)
@@ -42,11 +44,35 @@ class HeadsetReport:
     a2dp_codecs: list[Evidence] = field(default_factory=list)
     a2dp_selected: Evidence | None = None
     avrcp_events: Evidence | None = None
+    headset_subscribes: Evidence | None = None
     absolute_volume: Evidence = field(default_factory=lambda: Evidence("unknown (no AVRCP capability exchange captured)"))
-    volume_changes: list[Evidence] = field(default_factory=list)
+    headset_volume: list[tuple[int, int]] = field(default_factory=list)  # (value 0..127, frame) pushed by headset
+    phone_volume: list[tuple[int, int]] = field(default_factory=list)  # SetAbsoluteVolume from phone
     buttons: list[Evidence] = field(default_factory=list)
     other_channels: list[Evidence] = field(default_factory=list)
+    services: list[Evidence] = field(default_factory=list)  # SDP records the headset advertises
+    device_id: Evidence | None = None
     media_packets: int = 0
+
+    @property
+    def volume_steps(self) -> Counter:
+        values = [v for v, _ in self.headset_volume]
+        return Counter(abs(b - a) for a, b in zip(values, values[1:]) if b != a)
+
+
+def _replies(lines: list[tuple[Message, hfp.AtLine]], index: int) -> list[str]:
+    """The phone's answer to the headset command at ``index`` (up to OK/ERROR)."""
+    channel = lines[index][0].channel
+    out = []
+    for m, ln in lines[index + 1 :]:
+        if m.channel != channel:
+            continue
+        if ln.from_headset:
+            break
+        out.append(ln.text)
+        if ln.text in ("OK", "ERROR") or ln.text.startswith("+CME ERROR"):
+            break
+    return out
 
 
 def audit(s: Session) -> HeadsetReport:
@@ -57,21 +83,55 @@ def audit(s: Session) -> HeadsetReport:
     def seen(profile: str, frame: int) -> None:
         r.profiles.setdefault(profile, Evidence(profile)).frames.append(frame)
 
+    # -- SDP: what the headset says it offers ----------------------------------------------
+    # Phones ask for the same record several times with different attribute subsets; merge
+    # answers that describe the same service classes into one record.
+    merged: dict[tuple[str, ...], tuple[sdp.ServiceRecord, list[int]]] = {}
+    for m, record in s.sdp:
+        if m.direction is not FROM_HEADSET:
+            continue  # the phone's own records (e.g. its Hands-Free AG channel)
+        key = tuple(c.value for c in record.classes) or (f"frame {m.frame}",)
+        if key in merged:
+            merged[key][0].attributes.update(record.attributes)
+            merged[key][1].append(m.frame)
+        else:
+            merged[key] = (sdp.ServiceRecord(dict(record.attributes), m.frame), [m.frame])
+    for record, frames in merged.values():
+        e = Evidence(record.describe(), sorted(set(frames)))
+        if record.device_id is not None:
+            r.device_id = e
+        else:
+            r.services.append(e)
+
     # -- HFP / HSP ------------------------------------------------------------------------
-    for m, line in s.at_lines:
+    nonstandard: dict[str, Evidence] = {}
+    last_battery: tuple[str, float] | None = None  # (line text, time) of the previous report
+    for i, (m, line) in enumerate(s.at_lines):
         cmd = line.command
+        t = (m.timestamp_us - t0) / 1e6
         seen("HFP/HSP (calls, AT commands) on " + m.channel, m.frame)
-        is_query = line.text.endswith("?")
-        if cmd in ("AT+BRSF", "+BRSF", "AT+BAC", "AT+XAPL", "AT+BIND", "+BCS", "AT+NREC") and not is_query:
-            r.hfp.append(Evidence(f"{line.text}  ->  {line.describe()}", [m.frame]))
+        if cmd in HANDSHAKE_COMMANDS and not line.text.endswith("=?"):
+            if cmd == "AT+CGMI" or not line.text.endswith("?"):
+                answer = ""
+                if line.from_headset and cmd in ("AT+CGMI", "AT+CGMM"):
+                    reply = [x for x in _replies(s.at_lines, i) if x.startswith(cmd[2:])]
+                    answer = f"  (phone: {' | '.join(reply)})" if reply else ""
+                r.hfp.append(Evidence(f"{line.text}  ->  {line.describe()}{answer}", [m.frame]))
+        if line.from_headset and not hfp.is_standard(cmd):
+            reply = " | ".join(_replies(s.at_lines, i)) or "no reply"
+            nonstandard.setdefault(line.text, Evidence(f"{line.text}  ->  phone: {reply}")).frames.append(m.frame)
         pct = line.battery_percent
         if pct is not None and line.from_headset:
-            r.battery.append(((m.timestamp_us - t0) / 1e6, pct, cmd, m.frame))
+            if last_battery and last_battery[0] == line.text and t - last_battery[1] < 1.0:
+                continue  # the identical report sent twice in a row
+            r.battery.append((t, pct, cmd, m.frame))
+            last_battery = (line.text, t)
         if cmd in ("AT+VGS", "+VGS", "AT+VGM", "+VGM"):
             who = "headset" if line.from_headset else "phone"
             r.hfp_volume.append(Evidence(f"{who}: {line.describe()}", [m.frame]))
         if line.from_headset and (cmd in HEADSET_CALL_COMMANDS or cmd.startswith("ATD")):
             r.call_buttons.append(Evidence(f"{line.text}  ({line.describe()})", [m.frame]))
+    r.nonstandard = list(nonstandard.values())
 
     # -- A2DP / AVDTP -------------------------------------------------------------------
     for m, sig in s.avdtp:
@@ -80,32 +140,49 @@ def audit(s: Session) -> HeadsetReport:
             r.a2dp_endpoints = sig.endpoints
         if sig.signal in (GET_CAPABILITIES, GET_ALL_CAPABILITIES) and m.direction is FROM_HEADSET and sig.codec:
             delay = ", delay reporting" if sig.delay_reporting else ""
-            r.a2dp_codecs.append(Evidence(f"{sig.codec}{delay}", [m.frame]))
+            value = f"{sig.codec}{delay}"
+            existing = next((e for e in r.a2dp_codecs if e.value == value), None)
+            if existing:
+                existing.frames.append(m.frame)
+            else:
+                r.a2dp_codecs.append(Evidence(value, [m.frame]))
         if sig.signal == SET_CONFIGURATION and sig.is_command and sig.codec:
-            r.a2dp_selected = Evidence(str(sig.codec), [m.frame])
+            if r.a2dp_selected and r.a2dp_selected.value == str(sig.codec):
+                r.a2dp_selected.frames.append(m.frame)
+            else:
+                r.a2dp_selected = Evidence(str(sig.codec), [m.frame])
 
     # -- AVRCP --------------------------------------------------------------------------
     pressed: dict[str, list[int]] = {}
     abs_frames: list[int] = []
+    subscribed: dict[str, list[int]] = {}
     for m, msg in s.avrcp:
         seen("AVRCP (remote control)", m.frame)
-        if msg.supported_events and m.direction is FROM_HEADSET:
+        from_headset = m.direction is FROM_HEADSET
+        if msg.supported_events and from_headset:
             names = [avrcp.EVENTS.get(e, hex(e)) for e in msg.supported_events]
             r.avrcp_events = Evidence(", ".join(names), [m.frame])
             if avrcp.EVENT_VOLUME_CHANGED in msg.supported_events:
                 r.absolute_volume = Evidence("supported: headset advertises VOLUME_CHANGED", [m.frame])
             elif "supported" not in r.absolute_volume.value:
                 r.absolute_volume = Evidence("not advertised: VOLUME_CHANGED missing from headset capabilities", [m.frame])
-        if msg.pdu == avrcp.PDU_SET_ABSOLUTE_VOLUME and m.direction is FROM_HEADSET and msg.ctype == 0x9:
+        if msg.pdu == avrcp.PDU_SET_ABSOLUTE_VOLUME and from_headset and msg.ctype == 0x9:
             abs_frames.append(m.frame)
-        if msg.volume is not None:
-            who = "headset" if m.direction is FROM_HEADSET else "phone"
-            r.volume_changes.append(Evidence(f"{who}: {msg.describe()}", [m.frame]))
-        if msg.opcode == avrcp.OP_PASS_THROUGH and not msg.is_response and not msg.released and m.direction is FROM_HEADSET:
+        if msg.pdu == avrcp.PDU_SET_ABSOLUTE_VOLUME and not from_headset and not msg.is_response and msg.volume is not None:
+            r.phone_volume.append((msg.volume, m.frame))
+        if msg.event == avrcp.EVENT_VOLUME_CHANGED and from_headset and msg.ctype == 0xD and msg.volume is not None:
+            r.headset_volume.append((msg.volume, m.frame))
+        if msg.pdu == avrcp.PDU_REGISTER_NOTIFICATION and from_headset and not msg.is_response and msg.event is not None:
+            subscribed.setdefault(avrcp.EVENTS.get(msg.event, hex(msg.event)), []).append(m.frame)
+        if msg.opcode == avrcp.OP_PASS_THROUGH and not msg.is_response and not msg.released and from_headset:
             name = avrcp.PASS_THROUGH_OPS.get(msg.operation or 0, f"op 0x{msg.operation:02x}")
             pressed.setdefault(name, []).append(m.frame)
     if abs_frames:
         r.absolute_volume = Evidence("supported: headset ACCEPTED SetAbsoluteVolume", abs_frames)
+    if subscribed:
+        r.headset_subscribes = Evidence(
+            ", ".join(f"{name} x{len(fr)}" for name, fr in subscribed.items()), [f for fr in subscribed.values() for f in fr]
+        )
     r.buttons = [Evidence(f"{name} x{len(fr)}", fr) for name, fr in pressed.items()]
 
     # -- anything else that carries data -----------------------------------------------
@@ -123,6 +200,13 @@ def format_report(r: HeadsetReport) -> str:
     out.append("\nprofiles seen:")
     out += [f"  {e}" for e in r.profiles.values()] or ["  none"]
 
+    out.append("\nservices the headset advertises (SDP):")
+    if r.device_id:
+        out.append(f"  {r.device_id}")
+    out += [f"  {e}" for e in r.services]
+    if not r.services and not r.device_id:
+        out.append("  none captured (the phone may have cached them; re-pair while logging)")
+
     out.append("\nA2DP audio:")
     if r.a2dp_endpoints:
         out.append("  endpoints: " + ", ".join(f"SEID {e.seid} {'sink' if e.is_sink else 'source'}" for e in r.a2dp_endpoints))
@@ -136,7 +220,19 @@ def format_report(r: HeadsetReport) -> str:
     out.append(f"  absolute (hardware) volume: {r.absolute_volume}")
     if r.avrcp_events:
         out.append(f"  headset events: {r.avrcp_events}")
-    out += [f"  volume: {e}" for e in r.volume_changes[:10]]
+    if r.headset_subscribes:
+        out.append(f"  headset watches phone events: {r.headset_subscribes}")
+    if r.headset_volume:
+        values = [v for v, _ in r.headset_volume]
+        frames = [f for _, f in r.headset_volume]
+        levels = sorted(set(values))
+        steps = ", ".join(f"{k} x{n}" for k, n in r.volume_steps.most_common())
+        out.append(f"  {Evidence(f'headset-initiated volume changes: {len(values)}', frames)}")
+        out.append(f"    levels seen ({len(levels)}): {' '.join(map(str, levels))}")
+        out.append(f"    step sizes: {steps}")
+    if r.phone_volume:
+        shown = ", ".join(f"{v}/127 (frame {f})" for v, f in r.phone_volume[:8])
+        out.append(f"  phone set volume: {shown}")
     out += [f"  button pressed: {e}" for e in r.buttons] or ["  button presses: none captured"]
 
     out.append("\nHFP (calls, battery, call volume):")
@@ -146,8 +242,15 @@ def format_report(r: HeadsetReport) -> str:
         out.append("  battery source: " + ", ".join(dict.fromkeys(src for _, _, src, _ in r.battery)))
     else:
         out.append("  battery reports: none captured")
-    out += [f"  {e}" for e in r.hfp_volume[:10]]
+    seen_volume = set()
+    for e in r.hfp_volume:
+        if e.value not in seen_volume:
+            out.append(f"  {e}")
+            seen_volume.add(e.value)
     out += [f"  call button: {e}" for e in r.call_buttons]
+    if r.nonstandard:
+        out.append("  non-standard commands from the headset (vendor-specific, worth investigating):")
+        out += [f"    {e}" for e in r.nonstandard]
 
     out.append("\nother data channels (possible vendor protocol):")
     out += [f"  {e}" for e in r.other_channels] or ["  none - no BLE GATT writes or non-AT serial data seen"]

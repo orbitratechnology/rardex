@@ -10,10 +10,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import att, avdtp, avrcp, hfp, rfcomm
+from . import att, avdtp, avrcp, hfp, rfcomm, sdp
 from .btsnoop import Capture, Direction
 from .gatt import GattDatabase
-from .hci import CID_ATT, PSM_ATT, PSM_AVCTP, PSM_AVDTP, PSM_RFCOMM, Connection, L2capDecoder, L2capPdu
+from .hci import (
+    CID_ATT,
+    PSM_ATT,
+    PSM_AVCTP,
+    PSM_AVDTP,
+    PSM_RFCOMM,
+    PSM_SDP,
+    Connection,
+    FailedConnection,
+    L2capDecoder,
+    L2capPdu,
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +47,8 @@ class Session:
     capture: Capture
     connections: list[Connection]
     gatt: GattDatabase
+    failed_connections: list[FailedConnection] = field(default_factory=list)
+    acl_packets: dict[int, int] = field(default_factory=dict)  # per ACL handle
     att: list[att.AttPdu] = field(default_factory=list)
     rfcomm: list[rfcomm.RfcommFrame] = field(default_factory=list)
     l2cap: list[L2capPdu] = field(default_factory=list)
@@ -43,6 +56,7 @@ class Session:
     at_lines: list[tuple[Message, hfp.AtLine]] = field(default_factory=list)
     avrcp: list[tuple[Message, avrcp.AvrcpMessage]] = field(default_factory=list)
     avdtp: list[tuple[Message, avdtp.AvdtpSignal]] = field(default_factory=list)
+    sdp: list[tuple[Message, sdp.ServiceRecord]] = field(default_factory=list)  # message = completing response
     media_packets: int = 0  # A2DP audio packets seen (not decoded)
 
     def address_of(self, conn: int) -> str:
@@ -75,14 +89,17 @@ class Session:
 
 def decode(capture: Capture) -> Session:
     l2 = L2capDecoder()
-    s = Session(capture, l2.history, GattDatabase())
+    s = Session(capture, l2.history, GattDatabase(), l2.failed, l2.acl_packets)
     pending_reads: dict[tuple[int, Direction], int] = {}
     avdtp_signaling: dict[tuple[int, Direction], int] = {}  # first AVDTP CID = signaling
     at_channels: set[tuple[int, int]] = set()
+    sdp_parts = sdp.SdpReassembler()
     for pdu in l2.decode(capture.records):
         s.l2cap.append(pdu)
         if pdu.cid == CID_ATT or pdu.psm == PSM_ATT:
             _on_att(s, pdu, pending_reads)
+        elif pdu.psm == PSM_SDP:
+            _on_sdp(s, pdu, sdp_parts)
         elif pdu.psm == PSM_RFCOMM:
             _on_rfcomm(s, pdu, at_channels)
         elif pdu.psm == PSM_AVCTP:
@@ -118,6 +135,25 @@ def _on_att(s: Session, pdu: L2capPdu, pending_reads: dict[tuple[int, Direction]
         handle = pending_reads.pop((a.conn, a.direction.opposite()), None)
     if a.carries_data:
         s.messages.append(Message(a.frame, a.timestamp_us, a.direction, a.conn, f"ATT {_h(handle)}", a.name, handle, a.value))
+
+
+def _on_sdp(s: Session, pdu: L2capPdu, parts: sdp.SdpReassembler) -> None:
+    p = sdp.parse_pdu(pdu.payload)
+    if p is None:
+        return
+    records = parts.feed((pdu.handle, pdu.direction), p, pdu.frame)
+    if p.search_uuids:
+        note = "search: " + ", ".join(u.name for u in p.search_uuids)
+    elif records:
+        note = " | ".join(r.describe() for r in records)
+    elif records == []:
+        note = "no matching records"
+    else:
+        note = p.name + (" (continued)" if p.pdu_id in (sdp.ATTR_RSP, sdp.SEARCH_ATTR_RSP) else "")
+    kind = "RSP" if p.pdu_id & 1 else "REQ"
+    m = Message(pdu.frame, pdu.timestamp_us, pdu.direction, pdu.handle, "SDP", kind, None, pdu.payload, note)
+    s.messages.append(m)
+    s.sdp += [(m, r) for r in records or []]
 
 
 def _on_rfcomm(s: Session, pdu: L2capPdu, at_channels: set[tuple[int, int]]) -> None:

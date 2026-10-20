@@ -15,8 +15,9 @@ helps with both, on hardware you own:
 3. **Describe** the protocol in a small TOML file, then prove it: rebuild captured frames
    byte for byte and check that it identifies every frame in a capture.
 4. **Control** the speaker over BLE (via `bleak`) or classic RFCOMM, from the CLI or Python.
-5. **Audit headsets**: decode HFP AT commands (battery, call buttons, call volume), AVRCP
-   (buttons, absolute volume) and A2DP codec negotiation. `snoop features` produces a report
+5. **Audit headsets**: decode SDP service records (including the Device ID vendor), HFP AT
+   commands (battery, call buttons, call volume, vendor-specific commands), AVRCP (buttons,
+   absolute volume levels) and A2DP codec negotiation. `snoop features` produces a report
    citing frame numbers. On Linux, `rardex headset` reads battery and codec, sets hardware
    volume through BlueZ, and remaps headset buttons to your own commands.
 
@@ -134,6 +135,7 @@ src/rardex/
   rfcomm.py    RFCOMM frames (SPP)            session.py  all layers -> app-data messages
   hfp.py       HFP/HSP AT commands            avrcp.py    AVRCP buttons, absolute volume
   avdtp.py     A2DP codec negotiation         features.py headset feature audit
+  sdp.py       service records, Device ID (vendor), reassembly
   checksum.py  checksum zoo + detector        analyze.py  frame-structure inference
   protocol.py  TOML protocol files            client.py   SpeakerClient, stream reassembly
   transport.py BLE / RFCOMM / lab transports  bluez.py    Linux headset control (D-Bus, evdev)

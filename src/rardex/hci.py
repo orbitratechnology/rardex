@@ -41,6 +41,12 @@ PSM_NAMES = {
     0x0013: "HID-interrupt",
 }
 
+# ACL handles that carry controller diagnostics instead of a device link. Android snoop logs
+# commonly contain ACL traffic on 0x0EDC that no Connection Complete event ever opens and that
+# only flows controller -> host. It is the phone's Bluetooth chip talking about itself, not a
+# remote device, so it is kept out of L2CAP decoding and counted separately.
+DIAGNOSTIC_HANDLES = {0x0EDC}
+
 # HCI event codes we decode.
 EVT_DISCONNECTION_COMPLETE = 0x05
 EVT_CONNECTION_COMPLETE = 0x03
@@ -62,6 +68,27 @@ def parse_address(text: str) -> bytes:
     return parts[::-1]
 
 
+STATUS_CODES = {
+    0x04: "page timeout (device not reachable)",
+    0x05: "authentication failure",
+    0x06: "PIN or key missing",
+    0x08: "connection timeout",
+    0x0B: "connection already exists",
+    0x0D: "rejected: limited resources",
+    0x0F: "rejected: unacceptable address",
+    0x13: "remote user terminated",
+    0x14: "remote: low resources",
+    0x15: "remote: power off",
+    0x16: "terminated by local host",
+    0x22: "LMP response timeout",
+    0x3E: "failed to establish",
+}
+
+
+def status_text(code: int) -> str:
+    return f"0x{code:02x} {STATUS_CODES.get(code, '')}".strip()
+
+
 @dataclass
 class Connection:
     handle: int
@@ -69,6 +96,15 @@ class Connection:
     transport: str  # "LE" or "BR/EDR"
     opened_frame: int
     closed_frame: int | None = None
+    close_reason: int | None = None
+
+
+@dataclass(frozen=True)
+class FailedConnection:
+    address: str
+    transport: str
+    status: int
+    frame: int
 
 
 @dataclass(frozen=True)
@@ -100,11 +136,13 @@ class L2capDecoder:
     def __init__(self) -> None:
         self.connections: dict[int, Connection] = {}
         self.history: list[Connection] = []
+        self.failed: list[FailedConnection] = []
         self._partial: dict[tuple[int, Direction], tuple[int, bytearray]] = {}
         # (acl handle, direction the PDU travels, cid) -> psm
         self._channels: dict[tuple[int, Direction, int], int] = {}
         # (acl handle, requester's direction, requester's source cid) -> psm
         self._pending: dict[tuple[int, Direction, int], int] = {}
+        self.acl_packets: dict[int, int] = {}  # per ACL handle, including diagnostic handles
 
     def feed(self, record: Record) -> Iterator[L2capPdu]:
         if record.packet_type is PacketType.EVENT:
@@ -128,23 +166,29 @@ class L2capDecoder:
         if len(data) < 2:
             return
         code, params = data[0], data[2 : 2 + data[1]]
-        if code == EVT_CONNECTION_COMPLETE and len(params) >= 9 and params[0] == 0:
-            handle = struct.unpack_from("<H", params, 1)[0] & 0x0FFF
-            self._open(handle, params[3:9], "BR/EDR", record.index)
+        if code == EVT_CONNECTION_COMPLETE and len(params) >= 9:
+            if params[0] == 0:
+                handle = struct.unpack_from("<H", params, 1)[0] & 0x0FFF
+                self._open(handle, params[3:9], "BR/EDR", record.index)
+            else:
+                self.failed.append(FailedConnection(format_address(params[3:9]), "BR/EDR", params[0], record.index))
         elif code == EVT_LE_META and params:
             sub = params[0]
             if (
                 sub in (LE_CONNECTION_COMPLETE, LE_ENHANCED_CONNECTION_COMPLETE, LE_ENHANCED_CONNECTION_COMPLETE_V2)
                 and len(params) >= 12
-                and params[1] == 0
             ):
-                handle = struct.unpack_from("<H", params, 2)[0] & 0x0FFF
-                self._open(handle, params[6:12], "LE", record.index)
-        elif code == EVT_DISCONNECTION_COMPLETE and len(params) >= 3 and params[0] == 0:
+                if params[1] == 0:
+                    handle = struct.unpack_from("<H", params, 2)[0] & 0x0FFF
+                    self._open(handle, params[6:12], "LE", record.index)
+                else:
+                    self.failed.append(FailedConnection(format_address(params[6:12]), "LE", params[1], record.index))
+        elif code == EVT_DISCONNECTION_COMPLETE and len(params) >= 4 and params[0] == 0:
             handle = struct.unpack_from("<H", params, 1)[0] & 0x0FFF
             conn = self.connections.pop(handle, None)
             if conn:
                 conn.closed_frame = record.index
+                conn.close_reason = params[3]
             for key in [k for k in self._channels if k[0] == handle]:
                 del self._channels[key]
 
@@ -155,6 +199,9 @@ class L2capDecoder:
             return
         header, length = struct.unpack_from("<HH", record.data)
         handle, pb = header & 0x0FFF, (header >> 12) & 0x3
+        self.acl_packets[handle] = self.acl_packets.get(handle, 0) + 1
+        if handle in DIAGNOSTIC_HANDLES and not any(c.handle == handle for c in self.history):
+            return
         fragment = record.data[4 : 4 + length]
         key = (handle, record.direction)
         if pb == 0b01:  # continuation of a previous start fragment

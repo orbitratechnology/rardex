@@ -14,6 +14,7 @@ from .att import describe_error, Opcode
 from .btsnoop import Direction
 from .client import SpeakerClient, make_transport
 from .gatt import uuid_label
+from .hci import DIAGNOSTIC_HANDLES, status_text
 from .protocol import Protocol, ProtocolError
 from .session import Message, Session, decode
 from .transport import TransportError, _bleak
@@ -52,10 +53,27 @@ def cmd_snoop_info(args: argparse.Namespace) -> None:
     print(f"duration:    {cap.duration_us / 1e6:.1f}s")
     print("connections:")
     for c in s.connections or []:
-        closed = f", closed at frame {c.closed_frame}" if c.closed_frame else ""
+        closed = ""
+        if c.closed_frame:
+            reason = f" ({status_text(c.close_reason)})" if c.close_reason is not None else ""
+            closed = f", closed at frame {c.closed_frame}{reason}"
         print(f"  0x{c.handle:04x}  {c.address}  {c.transport}  opened at frame {c.opened_frame}{closed}")
     if not s.connections:
-        print("  none seen (connection was set up before logging started; data is still decoded)")
+        print("  none opened in this capture")
+    for f in s.failed_connections:
+        print(f"  FAILED  {f.address}  {f.transport}  frame {f.frame}: {status_text(f.status)}")
+    opened = {c.handle for c in s.connections}
+    print("acl handles:")
+    for handle, n in sorted(s.acl_packets.items()):
+        if handle in opened:
+            label = "device link"
+        elif handle in DIAGNOSTIC_HANDLES:
+            label = "controller diagnostics, not a device link (ignored)"
+        else:
+            label = "opened before logging started"
+        print(f"  0x{handle:04x}  {n:>6} packets  {label}")
+    if not s.acl_packets:
+        print("  none")
     protocols: dict[str, int] = {}
     for pdu in s.l2cap:
         protocols[pdu.protocol] = protocols.get(pdu.protocol, 0) + 1

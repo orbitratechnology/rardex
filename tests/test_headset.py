@@ -107,6 +107,68 @@ class HeadsetAuditTest(unittest.TestCase):
         self.assertIn("battery source: AT+IPHONEACCEV, AT+BIEV", text)
         self.assertNotIn("AT+BIND?", text)
 
+    def test_volume_levels_and_subscriptions(self):
+        r = self.report
+        self.assertEqual([v for v, _ in r.headset_volume], [88])
+        self.assertEqual([v for v, _ in r.phone_volume], [80])
+
+
+class RealWorldPatternsTest(unittest.TestCase):
+    """Behaviors first seen in real captures (Baseus Encok D02 Pro on Android)."""
+
+    def build(self, extra_records):
+        from rardex.btsnoop import PacketType, Record
+        from rardex.hci import build_acl, build_connection_complete
+
+        base = 1_792_490_400_000_000
+        records = [Record(1, base, btsnoop.Direction.RECEIVED, PacketType.EVENT, build_connection_complete(1, "11:22:33:44:55:66"), 0)]
+        for i, (direction, ptype, data) in enumerate(extra_records, 2):
+            records.append(Record(i, base + i * 1000, direction, ptype, data, 0))
+        return decode(btsnoop.parse(btsnoop.dump(records)))
+
+    def test_failed_connections_are_reported(self):
+        from rardex.btsnoop import PacketType
+
+        failed = bytes([0x03, 11, 0x04, 0, 0]) + bytes.fromhex("665544332211") + b"\x01\x00"
+        s = self.build([(btsnoop.Direction.RECEIVED, PacketType.EVENT, failed)])
+        self.assertEqual([(f.address, f.status) for f in s.failed_connections], [("11:22:33:44:55:66", 0x04)])
+
+    def test_diagnostic_handle_is_not_decoded_as_l2cap(self):
+        from rardex.btsnoop import PacketType
+
+        diag = struct.pack("<HH", 0x0EDC | 0x2000, 8) + bytes.fromhex("0400ff170015320701")[:8]
+        s = self.build([(btsnoop.Direction.RECEIVED, PacketType.ACL, diag)])
+        self.assertEqual(s.l2cap, [])
+        self.assertEqual(s.acl_packets, {0x0EDC: 1})
+
+    def test_repeated_battery_report_is_collapsed_and_vendor_command_flagged(self):
+        from rardex import rfcomm
+        from rardex.btsnoop import PacketType
+        from rardex.hci import CID_SIGNALING, build_acl, build_l2cap_connect, build_l2cap_connect_response
+
+        rx, tx = btsnoop.Direction.RECEIVED, btsnoop.Direction.SENT
+
+        def acl(direction, cid, payload):
+            return (direction, PacketType.ACL, build_acl(1, cid, payload, max_fragment=1021)[0])
+
+        def at(direction, text):
+            cid = 0x40 if direction is rx else 0x41
+            return acl(direction, cid, rfcomm.build_uih(6, text.encode(), initiator=direction is tx))
+
+        s = self.build([
+            acl(tx, CID_SIGNALING, build_l2cap_connect(1, 3, 0x40)),
+            acl(rx, CID_SIGNALING, build_l2cap_connect_response(1, 0x41, 0x40)),
+            at(rx, "AT+IPHONEACCEV=1,1,7\r"),
+            at(rx, "AT+IPHONEACCEV=1,1,7\r"),
+            at(tx, "\r\nOK\r\n"),
+            at(tx, "\r\nOK\r\n"),
+            at(rx, "AT+VDSF=1\r"),
+            at(tx, "\r\n+CME ERROR: 0\r\n"),
+        ])
+        r = audit(s)
+        self.assertEqual([p for _, p, _, _ in r.battery], [80])
+        self.assertEqual([e.value for e in r.nonstandard], ["AT+VDSF=1  ->  phone: +CME ERROR: 0"])
+
     def test_audit_of_ble_capture_reports_no_headset_profiles(self):
         r = audit(decode(btsnoop.parse(btsnoop.dump(lab.generate_capture()))))
         self.assertIn("unknown", r.absolute_volume.value)
@@ -202,3 +264,49 @@ class ButtonTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SdpTest(unittest.TestCase):
+    # Device ID (PnP Information) response from a real Baseus Encok D02 Pro capture.
+    DEVICE_ID_RSP = bytes.fromhex(
+        "070000003d003a3600373600340900000a0001000a09000136000319120009020009010309020109"
+        "05d609020209000a0902030902400902042801090205090001" "00"
+    )
+
+    def test_real_device_id_record(self):
+        from rardex import sdp
+
+        pdu = sdp.parse_pdu(self.DEVICE_ID_RSP)
+        records = sdp.SdpReassembler().feed((1, 1), pdu, 663)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].device_id, {"vendor": 0x05D6, "product": 0x000A, "version": 0x0240, "source": 1})
+        self.assertIn("Zhuhai Jieli Technology", records[0].describe())
+
+    def test_elements_and_service_record(self):
+        from rardex import sdp
+
+        e = sdp.element
+        uuid16 = lambda v: e(3, v.to_bytes(2, "big"))
+        u16 = lambda v: e(1, v.to_bytes(2, "big"))
+        record = e(6, u16(0x0001) + e(6, uuid16(0x111E) + uuid16(0x1203))
+                   + u16(0x0004) + e(6, e(6, uuid16(0x0100)) + e(6, uuid16(0x0003) + e(1, b"\x04")))
+                   + u16(0x0009) + e(6, e(6, uuid16(0x111E) + u16(0x0108)))
+                   + u16(0x0100) + e(4, b"JL_HFP\x00")
+                   + u16(0x0311) + u16(0x003F))
+        rec = sdp.records_from_attribute_lists(e(6, record), 1, single=False)[0]
+        self.assertEqual([c.name for c in rec.classes], ["Hands-Free", "Generic Audio"])
+        self.assertEqual((rec.rfcomm_channel, rec.name), (4, "JL_HFP"))
+        self.assertEqual(rec.describe(), "Hands-Free + Generic Audio; Hands-Free v1.8; name 'JL_HFP'; RFCOMM channel 4; features 0x003f")
+
+    def test_continuation_is_reassembled(self):
+        from rardex import sdp
+
+        e = sdp.element
+        blob = e(6, e(6, e(1, b"\x00\x01") + e(6, e(3, b"\x11\x0b"))))
+        first, second = blob[:5], blob[5:]
+        rsp = lambda chunk, cont: bytes([0x07, 0, 1]) + struct.pack(">H", 2 + len(chunk) + 1 + len(cont)) + struct.pack(">H", len(chunk)) + chunk + bytes([len(cont)]) + cont
+        r = sdp.SdpReassembler()
+        self.assertIsNone(r.feed((1, 1), sdp.parse_pdu(rsp(first, b"\x05")), 10))
+        records = r.feed((1, 1), sdp.parse_pdu(rsp(second, b"")), 11)
+        self.assertEqual([c.name for c in records[0].classes], ["A2DP Sink"])
+        self.assertEqual(r.feed((1, 1), sdp.parse_pdu(rsp(e(6, b""), b"")), 12), [])
