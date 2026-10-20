@@ -121,7 +121,8 @@ class HeadsetAuditTest(unittest.TestCase):
 class RealWorldPatternsTest(unittest.TestCase):
     """Behaviors first seen in real captures (Baseus Encok D02 Pro on Android)."""
 
-    def build(self, extra_records):
+    @staticmethod
+    def build(extra_records):
         from rardex.btsnoop import PacketType, Record
         from rardex.hci import build_acl, build_connection_complete
 
@@ -315,3 +316,48 @@ class SdpTest(unittest.TestCase):
         records = r.feed((1, 1), sdp.parse_pdu(rsp(second, b"")), 11)
         self.assertEqual([c.name for c in records[0].classes], ["A2DP Sink"])
         self.assertEqual(r.feed((1, 1), sdp.parse_pdu(rsp(e(6, b""), b"")), 12), [])
+
+
+class DeviceIdentityTest(unittest.TestCase):
+    """HCI events that identify the remote device, as seen in real captures."""
+
+    def test_name_class_and_controller_version(self):
+        from rardex.btsnoop import Capture, Datalink, PacketType, Record
+        from rardex.hci import build_connection_complete, parse_address
+        from rardex.session import decode, device_details
+
+        addr = "11:22:33:44:55:66"
+        raw = parse_address(addr)
+        request = bytes([0x04, 10]) + raw + (0x240404).to_bytes(3, "little") + b"\x01"
+        name = bytes([0x07, 255, 0x00]) + raw + b"Practice Headset".ljust(248, b"\x00")
+        version = bytes([0x0C, 8, 0x00]) + struct.pack("<HBHH", 0x0001, 12, 0x05D6, 0x22BB)
+        events = [request, build_connection_complete(1, addr), name, version]
+        records = [Record(i, i * 1000, btsnoop.Direction.RECEIVED, PacketType.EVENT, e, 0) for i, e in enumerate(events, 1)]
+        s = decode(Capture(Datalink.H4, records))
+        lines = device_details(s, addr)
+        self.assertIn("name 'Practice Headset'", lines[0])
+        self.assertIn("Audio/Video: wearable headset; services: rendering, audio", lines[1])
+        self.assertIn("Bluetooth 5.3 (LMP 12), manufacturer 0x05d6 Zhuhai Jieli Technology Co., Ltd", lines[2])
+
+    def test_assigned_numbers(self):
+        from rardex.assigned import bluetooth_version, company, device_class
+
+        self.assertEqual(bluetooth_version(9), "Bluetooth 5.0")
+        self.assertEqual(bluetooth_version(99), "LMP version 99")
+        self.assertIn("look up", company(0x1234))
+        self.assertEqual(device_class(0x240418), "Audio/Video: headphones; services: rendering, audio")
+
+    def test_offload_note_when_stream_starts_without_media(self):
+        from rardex import avdtp
+        from rardex.btsnoop import PacketType
+        from rardex.hci import build_acl, build_l2cap_connect, build_l2cap_connect_response, CID_SIGNALING
+
+        tx, rx = btsnoop.Direction.SENT, btsnoop.Direction.RECEIVED
+        acl = lambda d, cid, p: (d, PacketType.ACL, build_acl(1, cid, p, max_fragment=1021)[0])
+        s = RealWorldPatternsTest.build([
+            acl(tx, CID_SIGNALING, build_l2cap_connect(1, 0x19, 0x40)),
+            acl(rx, CID_SIGNALING, build_l2cap_connect_response(1, 0x41, 0x40)),
+            acl(tx, 0x41, avdtp.build(1, 0, avdtp.START, b"\x04")),
+            acl(rx, 0x40, avdtp.build(1, 2, avdtp.START, b"")),
+        ])
+        self.assertIn("offloads A2DP encoding", format_report(audit(s)))

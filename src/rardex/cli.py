@@ -16,7 +16,7 @@ from .client import SpeakerClient, make_transport
 from .gatt import uuid_label
 from .hci import DIAGNOSTIC_HANDLES, status_text
 from .protocol import Protocol, ProtocolError
-from .session import Message, Session, decode
+from .session import Message, Session, decode, device_details
 from .transport import TransportError, _bleak
 from .util import fmt_seconds, hexs, parse_hex, printable
 
@@ -58,6 +58,9 @@ def cmd_snoop_info(args: argparse.Namespace) -> None:
             reason = f" ({status_text(c.close_reason)})" if c.close_reason is not None else ""
             closed = f", closed at frame {c.closed_frame}{reason}"
         print(f"  0x{c.handle:04x}  {c.address}  {c.transport}  opened at frame {c.opened_frame}{closed}")
+    for address in dict.fromkeys(c.address for c in s.connections):
+        for line in device_details(s, address):
+            print(f"          {line}")
     if not s.connections:
         print("  none opened in this capture")
     for f in s.failed_connections:

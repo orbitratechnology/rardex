@@ -12,9 +12,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from . import avrcp, hfp, sdp
-from .avdtp import DISCOVER, GET_ALL_CAPABILITIES, GET_CAPABILITIES, SET_CONFIGURATION, Endpoint
+from .avdtp import DISCOVER, GET_ALL_CAPABILITIES, GET_CAPABILITIES, SET_CONFIGURATION, START, Endpoint
 from .btsnoop import Direction
-from .session import Message, Session
+from .session import Message, Session, device_details
 
 FROM_HEADSET = Direction.RECEIVED  # snoop logs are recorded on the phone/PC side
 HEADSET_CALL_COMMANDS = {"ATA", "AT+CHUP", "AT+BLDN", "AT+BVRA", "ATD", "AT+CKPD"}
@@ -54,6 +54,7 @@ class HeadsetReport:
     services: list[Evidence] = field(default_factory=list)  # SDP records the headset advertises
     device_id: Evidence | None = None
     media_packets: int = 0
+    stream_started: list[int] = field(default_factory=list)  # AVDTP START accepted
 
     @property
     def volume_steps(self) -> Counter:
@@ -79,6 +80,8 @@ def _replies(lines: list[tuple[Message, hfp.AtLine]], index: int) -> list[str]:
 def audit(s: Session) -> HeadsetReport:
     r = HeadsetReport(media_packets=s.media_packets)
     r.devices = [f"{c.address} ({c.transport}, handle 0x{c.handle:04x})" for c in s.connections]
+    for address in dict.fromkeys(c.address for c in s.connections):
+        r.devices += device_details(s, address)
     t0 = s.capture.start_us
 
     def seen(profile: str, frame: int) -> None:
@@ -147,6 +150,8 @@ def audit(s: Session) -> HeadsetReport:
                 existing.frames.append(m.frame)
             else:
                 r.a2dp_codecs.append(Evidence(value, [m.frame]))
+        if sig.signal == START and sig.message_type == 2:
+            r.stream_started.append(m.frame)
         if sig.signal == SET_CONFIGURATION and sig.is_command and sig.codec:
             if r.a2dp_selected and r.a2dp_selected.value == str(sig.codec):
                 r.a2dp_selected.frames.append(m.frame)
@@ -230,6 +235,10 @@ def format_report(r: HeadsetReport) -> str:
         out.append(f"  selected: {r.a2dp_selected}")
     if r.media_packets:
         out.append(f"  audio packets: {r.media_packets} (not decoded)")
+    elif r.stream_started:
+        out.append(
+            f"  {Evidence('streaming started but no audio packets in the log: the phone probably offloads A2DP encoding to its Bluetooth chip/DSP, so audio bypasses HCI', r.stream_started)}"
+        )
 
     out.append("\nAVRCP remote control:")
     out.append(f"  absolute (hardware) volume: {r.absolute_volume}")

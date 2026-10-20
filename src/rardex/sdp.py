@@ -18,6 +18,8 @@ import uuid as _uuid
 from dataclasses import dataclass
 from typing import Any
 
+from .assigned import COMPANIES
+
 SEARCH_ATTR_REQ, SEARCH_ATTR_RSP = 0x06, 0x07
 ATTR_REQ, ATTR_RSP = 0x04, 0x05
 PDU_NAMES = {0x01: "error", 0x02: "search req", 0x03: "search rsp", 0x04: "attribute req", 0x05: "attribute rsp", 0x06: "search+attribute req", 0x07: "search+attribute rsp"}
@@ -47,10 +49,6 @@ UUID_NAMES = {
     "1200": "Device ID (PnP Information)",
     "1203": "Generic Audio",
 }
-
-# Company identifiers checked against the Bluetooth SIG assigned-numbers list. Add entries only
-# after verifying them there; an unknown id is printed raw for you to look up.
-KNOWN_COMPANIES = {0x05D6: "Zhuhai Jieli Technology Co., Ltd"}
 
 ATTR_CLASSES, ATTR_PROTOCOLS, ATTR_PROFILES = 0x0001, 0x0004, 0x0009
 ATTR_NAME, ATTR_FEATURES = 0x0100, 0x0311
@@ -167,8 +165,8 @@ class ServiceRecord:
         if did is not None:
             vendor = did.get("vendor")
             source = {1: "Bluetooth SIG company id", 2: "USB vendor id"}.get(did.get("source", 0), "unknown id source")
-            company = KNOWN_COMPANIES.get(vendor, "") if did.get("source") == 1 else ""
-            parts = [f"Device ID: vendor 0x{vendor:04x} ({source}{': ' + company if company else ''})" if vendor is not None else "Device ID"]
+            name = COMPANIES.get(vendor, "") if did.get("source") == 1 else ""
+            parts = [f"Device ID: vendor 0x{vendor:04x} ({source}{': ' + name if name else ''})" if vendor is not None else "Device ID"]
             if "product" in did:
                 parts.append(f"product 0x{did['product']:04x}")
             if "version" in did:

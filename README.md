@@ -110,7 +110,7 @@ rardex ctl protocols/mine.toml --address AA:BB:CC:DD:EE:FF volume level=12 --lis
 
 | Command | Purpose |
 |---|---|
-| `snoop info FILE` | Datalink, connections, protocols, busiest app-data channels |
+| `snoop info FILE` | Connections (incl. failed), device name/class/chip version, ACL handles, protocols, busiest channels |
 | `snoop gatt FILE` | GATT table rebuilt from discovery; marks where the app writes / device notifies |
 | `snoop timeline FILE` | App data in time order, split at pauses; `--protocol` names known frames |
 | `snoop features FILE` | Headset audit: profiles, A2DP codecs, absolute volume, battery, buttons (cites frames) |
@@ -136,6 +136,7 @@ src/rardex/
   hfp.py       HFP/HSP AT commands            avrcp.py    AVRCP buttons, absolute volume
   avdtp.py     A2DP codec negotiation         features.py headset feature audit
   sdp.py       service records, Device ID (vendor), reassembly
+  assigned.py  verified SIG company ids, Bluetooth versions, Class of Device
   checksum.py  checksum zoo + detector        analyze.py  frame-structure inference
   protocol.py  TOML protocol files            client.py   SpeakerClient, stream reassembly
   transport.py BLE / RFCOMM / lab transports  bluez.py    Linux headset control (D-Bus, evdev)

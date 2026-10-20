@@ -13,7 +13,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 
-DISCOVER, GET_CAPABILITIES, SET_CONFIGURATION, GET_ALL_CAPABILITIES = 0x01, 0x02, 0x03, 0x0C
+DISCOVER, GET_CAPABILITIES, SET_CONFIGURATION, START, GET_ALL_CAPABILITIES = 0x01, 0x02, 0x03, 0x07, 0x0C
 SIGNALS = {
     0x01: "DISCOVER",
     0x02: "GET_CAPABILITIES",

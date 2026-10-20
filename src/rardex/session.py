@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from . import att, avdtp, avrcp, hfp, rfcomm, sdp
+from .assigned import device_class
 from .btsnoop import Capture, Direction
 from .gatt import GattDatabase
 from .hci import (
@@ -49,6 +50,8 @@ class Session:
     gatt: GattDatabase
     failed_connections: list[FailedConnection] = field(default_factory=list)
     acl_packets: dict[int, int] = field(default_factory=dict)  # per ACL handle
+    device_names: dict[str, str] = field(default_factory=dict)  # address -> remote name
+    device_classes: dict[str, int] = field(default_factory=dict)  # address -> Class of Device
     att: list[att.AttPdu] = field(default_factory=list)
     rfcomm: list[rfcomm.RfcommFrame] = field(default_factory=list)
     l2cap: list[L2capPdu] = field(default_factory=list)
@@ -87,9 +90,26 @@ class Session:
         return out
 
 
+def device_details(s: Session, address: str) -> list[str]:
+    """Name, class and controller version for a device, from the HCI events in the capture."""
+    out = []
+    if address in s.device_names:
+        out.append(f"{address}: name {s.device_names[address]!r}")
+    if address in s.device_classes:
+        cod = s.device_classes[address]
+        out.append(f"{address}: class 0x{cod:06x} ({device_class(cod)})")
+    versions: dict[str, list[int]] = {}
+    for c in s.connections:
+        if c.address == address and c.version:
+            versions.setdefault(c.version.describe(), []).append(c.version.frame)
+    for text, frames in versions.items():
+        out.append(f"{address}: controller {text} [frames {', '.join(map(str, frames))}]")
+    return out
+
+
 def decode(capture: Capture) -> Session:
     l2 = L2capDecoder()
-    s = Session(capture, l2.history, GattDatabase(), l2.failed, l2.acl_packets)
+    s = Session(capture, l2.history, GattDatabase(), l2.failed, l2.acl_packets, l2.names, l2.classes)
     pending_reads: dict[tuple[int, Direction], int] = {}
     avdtp_signaling: dict[tuple[int, Direction], int] = {}  # first AVDTP CID = signaling
     at_channels: set[tuple[int, int]] = set()

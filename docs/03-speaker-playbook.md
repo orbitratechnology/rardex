@@ -82,7 +82,20 @@ What else in the bug report is useful (and what isn't):
   level the phone last received. It's a good cross-check for `rardex snoop features`.
   Extract it with
   `unzip -p bugreport.zip 'bugreport-*.txt' | sed -n '/DUMP OF SERVICE bluetooth_manager/,/^DUMP OF SERVICE /p' > bt-dumpsys.txt`.
-  It names *every* paired device, so review it before sharing.
+  It names *every* paired device (and what you were playing), so review it before sharing.
+  Fields that pay off:
+  - `remote_info:LMP-SUBVERSION-MANUFACTURER` (decimal) in `shim::record`: the device chip's
+    Bluetooth version and SIG company id;
+  - `BTAudio Media Key Events`: `key=` is the AVRCP operation id in decimal (68 play,
+    70 pause, 75 next, 76 previous);
+  - `AvrcpVolumeManager`: whether absolute volume is on (`AbsVol`) and every volume change;
+  - `A2DP <codec> State` and `A2dpOffloadEnabled`: the codec config, and whether audio
+    bypasses the snoop log;
+  - `Link Key Types` / `SecureConn`: how the device paired.
+
+  To line it up with a capture, find one event in both (a media key press is ideal) and
+  compute the clock offset. On the phone used in chapter 5 the offset was zero; check it
+  before relying on that.
 - **Rarely useful:** per-HAL debug files such as `...IBluetoothHci_default.txt`. These are
   vendor driver dumps and are often empty, or only say that a dump directory doesn't exist.
   An empty dump means "not collected", not "nothing happened".

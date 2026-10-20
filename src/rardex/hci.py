@@ -17,6 +17,7 @@ import struct
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
+from .assigned import bluetooth_version, company
 from .btsnoop import Direction, PacketType, Record
 
 CID_SIGNALING = 0x0001
@@ -51,6 +52,9 @@ DIAGNOSTIC_HANDLES = {0x0EDC}
 # HCI event codes we decode.
 EVT_DISCONNECTION_COMPLETE = 0x05
 EVT_CONNECTION_COMPLETE = 0x03
+EVT_CONNECTION_REQUEST = 0x04  # incoming connection: carries the device's Class of Device
+EVT_REMOTE_NAME_COMPLETE = 0x07
+EVT_REMOTE_VERSION_COMPLETE = 0x0C  # the remote *controller's* LMP version and manufacturer
 EVT_LE_META = 0x3E
 LE_CONNECTION_COMPLETE = 0x01
 LE_ENHANCED_CONNECTION_COMPLETE = 0x0A
@@ -90,6 +94,22 @@ def status_text(code: int) -> str:
     return f"0x{code:02x} {STATUS_CODES.get(code, '')}".strip()
 
 
+@dataclass(frozen=True)
+class RemoteVersion:
+    """Read Remote Version Information: answered by the remote Bluetooth chip itself."""
+
+    lmp: int
+    manufacturer: int
+    subversion: int
+    frame: int
+
+    def describe(self) -> str:
+        return (
+            f"{bluetooth_version(self.lmp)} (LMP {self.lmp}), manufacturer {company(self.manufacturer)}, "
+            f"subversion 0x{self.subversion:04x}"
+        )
+
+
 @dataclass
 class Connection:
     handle: int
@@ -98,6 +118,7 @@ class Connection:
     opened_frame: int
     closed_frame: int | None = None
     close_reason: int | None = None
+    version: RemoteVersion | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +159,8 @@ class L2capDecoder:
         self.connections: dict[int, Connection] = {}
         self.history: list[Connection] = []
         self.failed: list[FailedConnection] = []
+        self.names: dict[str, str] = {}  # address -> name from Remote Name Request
+        self.classes: dict[str, int] = {}  # address -> Class of Device from Connection Request
         self._partial: dict[tuple[int, Direction], tuple[int, bytearray]] = {}
         # (acl handle, direction the PDU travels, cid) -> psm
         self._channels: dict[tuple[int, Direction, int], int] = {}
@@ -184,6 +207,17 @@ class L2capDecoder:
                     self._open(handle, params[6:12], "LE", record.index)
                 else:
                     self.failed.append(FailedConnection(format_address(params[6:12]), "LE", params[1], record.index))
+        elif code == EVT_CONNECTION_REQUEST and len(params) >= 9:
+            self.classes[format_address(params[0:6])] = int.from_bytes(params[6:9], "little")
+        elif code == EVT_REMOTE_NAME_COMPLETE and len(params) >= 7 and params[0] == 0:
+            name = params[7:].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            if name:
+                self.names[format_address(params[1:7])] = name
+        elif code == EVT_REMOTE_VERSION_COMPLETE and len(params) >= 8 and params[0] == 0:
+            handle, lmp, mfr, sub = struct.unpack_from("<HBHH", params, 1)
+            conn = self.connections.get(handle & 0x0FFF)
+            if conn is not None:
+                conn.version = RemoteVersion(lmp, mfr, sub, record.index)
         elif code == EVT_DISCONNECTION_COMPLETE and len(params) >= 4 and params[0] == 0:
             handle = struct.unpack_from("<H", params, 1)[0] & 0x0FFF
             conn = self.connections.pop(handle, None)
