@@ -49,6 +49,7 @@ class HeadsetReport:
     headset_volume: list[tuple[int, int]] = field(default_factory=list)  # (value 0..127, frame) pushed by headset
     phone_volume: list[tuple[int, int]] = field(default_factory=list)  # SetAbsoluteVolume from phone
     buttons: list[Evidence] = field(default_factory=list)
+    buttons_note: str = ""
     other_channels: list[Evidence] = field(default_factory=list)
     services: list[Evidence] = field(default_factory=list)  # SDP records the headset advertises
     device_id: Evidence | None = None
@@ -154,6 +155,8 @@ def audit(s: Session) -> HeadsetReport:
 
     # -- AVRCP --------------------------------------------------------------------------
     pressed: dict[str, list[int]] = {}
+    held: dict[str, list[float]] = {}  # press -> release gaps in ms, per button
+    last_press: dict[str, int] = {}  # button -> timestamp of its pending press
     abs_frames: list[int] = []
     subscribed: dict[str, list[int]] = {}
     for m, msg in s.avrcp:
@@ -174,16 +177,28 @@ def audit(s: Session) -> HeadsetReport:
             r.headset_volume.append((msg.volume, m.frame))
         if msg.pdu == avrcp.PDU_REGISTER_NOTIFICATION and from_headset and not msg.is_response and msg.event is not None:
             subscribed.setdefault(avrcp.EVENTS.get(msg.event, hex(msg.event)), []).append(m.frame)
-        if msg.opcode == avrcp.OP_PASS_THROUGH and not msg.is_response and not msg.released and from_headset:
+        if msg.opcode == avrcp.OP_PASS_THROUGH and not msg.is_response and from_headset:
             name = avrcp.PASS_THROUGH_OPS.get(msg.operation or 0, f"op 0x{msg.operation:02x}")
-            pressed.setdefault(name, []).append(m.frame)
+            if not msg.released:
+                pressed.setdefault(name, []).append(m.frame)
+                last_press[name] = m.timestamp_us
+            elif name in last_press:
+                held.setdefault(name, []).append((m.timestamp_us - last_press.pop(name)) / 1000)
     if abs_frames:
         r.absolute_volume = Evidence("supported: headset ACCEPTED SetAbsoluteVolume", abs_frames)
     if subscribed:
         r.headset_subscribes = Evidence(
             ", ".join(f"{name} x{len(fr)}" for name, fr in subscribed.items()), [f for fr in subscribed.values() for f in fr]
         )
-    r.buttons = [Evidence(f"{name} x{len(fr)}", fr) for name, fr in pressed.items()]
+    for name, frames in pressed.items():
+        gaps = held.get(name)
+        timing = f", press->release {min(gaps):.0f}-{max(gaps):.0f} ms" if gaps else ""
+        r.buttons.append(Evidence(f"{name} x{len(frames)}{timing}", frames))
+    if held and max(g for gaps in held.values() for g in gaps) < 150:
+        r.buttons_note = (
+            "every press is released within 150 ms: the headset sends a complete click after deciding "
+            "what the gesture was (e.g. long press -> skip), so wire timing does not reflect finger timing"
+        )
 
     # -- anything else that carries data -----------------------------------------------
     counts = Counter(m.channel for m in s.messages if m.kind in ("UIH", "WRITE", "WRITE-NR", "NOTIFY", "INDICATE"))
@@ -234,6 +249,8 @@ def format_report(r: HeadsetReport) -> str:
         shown = ", ".join(f"{v}/127 (frame {f})" for v, f in r.phone_volume[:8])
         out.append(f"  phone set volume: {shown}")
     out += [f"  button pressed: {e}" for e in r.buttons] or ["  button presses: none captured"]
+    if r.buttons_note:
+        out.append(f"  ({r.buttons_note})")
 
     out.append("\nHFP (calls, battery, call volume):")
     out += [f"  {e}" for e in r.hfp] or ["  no HFP handshake captured"]

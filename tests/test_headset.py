@@ -97,7 +97,12 @@ class HeadsetAuditTest(unittest.TestCase):
     def test_avrcp(self):
         r = self.report
         self.assertTrue(r.absolute_volume.value.startswith("supported"))
-        self.assertEqual(sorted(e.value for e in r.buttons), ["next x1", "pause x1", "play x1", "previous x1"])
+        self.assertEqual(
+            sorted(e.value.split(",")[0] for e in r.buttons), ["next x1", "pause x1", "play x1", "previous x1"]
+        )
+        # The lab releases after 80 ms, plus ~0.9 ms simulated link latency per packet.
+        self.assertIn("press->release 82-82 ms", r.buttons[0].value)
+        self.assertIn("complete click", r.buttons_note)
 
     def test_hfp(self):
         r = self.report
